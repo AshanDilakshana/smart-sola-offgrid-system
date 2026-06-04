@@ -27,7 +27,7 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
 // ESP32 PIN Definitions
 // ---------------------------------------------------------
 const int BATTERY_PIN = 34;   
-const int SOLAR_PIN   = 32; // දැන් මේක Analog පින් එකක් විදිහට පාවිච්චි වේ
+const int SOLAR_PIN   = 32; 
 
 const int INV_RELAY   = 25;   
 const int SMPS_RELAY  = 26;   
@@ -37,10 +37,10 @@ const int ECO_SWITCH    = 14;
 const int PCUT_SWITCH   = 27; 
 const int MANUAL_SWITCH = 13; 
 
-// Voltage Divider Calibration (බැටරිය සහ සෝලර් දෙකටම සමාන අගයන්)
+// Voltage Divider Calibration
 const float R1 = 100000.0; 
 const float R2 = 10000.0;  
-const float V_REF = 3.21;   
+const float V_REF = 3.7385;   // ඔයාගේ අලුත් නිවැරදි කරපු කැලිබ්‍රේෂන් අගය
 
 // --- Easy Timer Configuration ---
 const unsigned long TIMER_DELAY_MS = 10000; 
@@ -56,22 +56,30 @@ bool inverterState = false;
 bool smpsState = false;
 int statusPage = 0; 
 
+// --- Super Strong Noise Filter Variables ---
+float lastBatVolt = 0.0;
+float lastSolVolt = 0.0;
+const float VOLTAGE_DEADBAND = 0.1; // 0.1V ට වඩා අඩු වෙනස්කම් නොසලකා හරියි
+
 void setup() {
   Serial.begin(115200);
 
+  // ADC එක 0-3.3V පරාසයට සකස් කිරීම
   analogSetAttenuation(ADC_11db);
 
-  // Active-Low Relay Boot Glitch Fix
+  // Active-Low Relay Boot Glitch Fix (ඉබේ ON වීම නැවැත්වීම)
   digitalWrite(INV_RELAY, HIGH);
   digitalWrite(SMPS_RELAY, HIGH);
   pinMode(INV_RELAY, OUTPUT);
   pinMode(SMPS_RELAY, OUTPUT);
 
+  // Sensing and Switch Pins
   pinMode(GRID_SENS, INPUT);
   pinMode(ECO_SWITCH, INPUT_PULLUP);
   pinMode(PCUT_SWITCH, INPUT_PULLUP);
   pinMode(MANUAL_SWITCH, INPUT_PULLUP);
 
+  // Initialize OLED
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
     Serial.println(F("SSD1306 allocation failed"));
     for(;;);
@@ -79,30 +87,64 @@ void setup() {
   display.clearDisplay();
   display.display();
 
+  // Initialize RTC
   if (!rtc.begin()) {
     Serial.println("RTC Not Found!");
   }
 
+  // Connect to WiFi
   WiFi.begin(ssid, password);
   timeClient.begin();
 }
 
-// බැටරි වෝල්ටීයතාවය මැනීම
+// ---------------------------------------------------------
+// 🛠️ NOISE FILTERED BATTERY VOLTAGE FUNCTION
+// ---------------------------------------------------------
 float getBatteryVoltage() {
-  int raw = analogRead(BATTERY_PIN);
+  long sum = 0;
+  int samples = 200; // සැරවල් 200ක් කියවා සාමාන්‍ය අගය ගනී
+  
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(BATTERY_PIN);
+    delayMicroseconds(50); // Wi-Fi Noise අහු නොවන ලෙස වේගයෙන් කියවයි
+  }
+  
+  float raw = (float)sum / samples;
   float v_out = (raw * V_REF) / 4095.0; 
-  float v_bat = v_out * ((R1 + R2) / R2);
-  return v_bat;
+  float newVolt = v_out * ((R1 + R2) / R2);
+
+  // Deadband Logic: වෙනස 0.1V ට වඩා අඩු නම්, පරණ අගයම තියාගන්නවා
+  if (abs(newVolt - lastBatVolt) >= VOLTAGE_DEADBAND) {
+    lastBatVolt = newVolt;
+  }
+  return lastBatVolt;
 }
 
-// සෝලර් වෝල්ටීයතාවය මැනීම (අලුත් ෆන්ක්ෂන් එක)
+// ---------------------------------------------------------
+// 🛠️ NOISE FILTERED SOLAR VOLTAGE FUNCTION
+// ---------------------------------------------------------
 float getSolarVoltage() {
-  int raw = analogRead(SOLAR_PIN);
+  long sum = 0;
+  int samples = 200; 
+  
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(SOLAR_PIN);
+    delayMicroseconds(50);
+  }
+  
+  float raw = (float)sum / samples;
   float v_out = (raw * V_REF) / 4095.0; 
-  float v_sol = v_out * ((R1 + R2) / R2);
-  return v_sol;
+  float newVolt = v_out * ((R1 + R2) / R2);
+
+  if (abs(newVolt - lastSolVolt) >= VOLTAGE_DEADBAND) {
+    lastSolVolt = newVolt;
+  }
+  return lastSolVolt;
 }
 
+// ---------------------------------------------------------
+// Draw WiFi Signal Bars
+// ---------------------------------------------------------
 void drawWiFiBars(int x, int y) {
   if (WiFi.status() != WL_CONNECTED) {
     display.setCursor(x, y);
@@ -126,23 +168,25 @@ void drawWiFiBars(int x, int y) {
 void loop() {
   String displayTime = "--:--";
 
+  // --- SMART TIME LOGIC (NTP vs RTC Fallback) ---
   if (WiFi.status() == WL_CONNECTED) {
     timeClient.update();
     displayTime = timeClient.getFormattedTime().substring(0, 5);
-    rtc.adjust(DateTime(timeClient.getEpochTime()));
+    rtc.adjust(DateTime(timeClient.getEpochTime())); // Sync RTC with Web Time
   } else {
     DateTime now = rtc.now();
     char buf[] = "hh:mm";
     displayTime = String(now.toString(buf));
   }
 
+  // Get Filtered Voltages
   float batVolt = getBatteryVoltage();
-  float solVolt = getSolarVoltage(); // ලයිව් සෝලර් වෝල්ටේජ් එක
+  float solVolt = getSolarVoltage(); 
   
-  // සෝලර් පැනල් එකෙන් 12V ට වඩා එනවා නම් විතරක් සෝලර් තියෙනවා (isSolar = true) ලෙස සලකයි
   bool isSolar = (solVolt > 12.0); 
   bool isGrid = digitalRead(GRID_SENS);
   
+  // Active-LOW State Reading
   bool manualMode = (digitalRead(MANUAL_SWITCH) == LOW); 
   bool ecoMode   = manualMode ? false : (digitalRead(ECO_SWITCH) == LOW);
   bool pcutMode  = manualMode ? false : (digitalRead(PCUT_SWITCH) == LOW); 
@@ -275,6 +319,9 @@ void loop() {
     inverterState = false;
   }
 
+  // ---------------------------------------------------------
+  // SMPS EXTRA CHARGER LOGIC
+  // ---------------------------------------------------------
   bool allowCharging = (errorString == "") && isGrid && !inverterState && (ecoMode || pcutMode || modeString == "POWER OFF");
 
   if (allowCharging) {
@@ -288,6 +335,7 @@ void loop() {
     smpsState = false; 
   }
 
+  // Execute Relay Actions (LOW = ON, HIGH = OFF)
   digitalWrite(INV_RELAY, inverterState ? LOW : HIGH);
   digitalWrite(SMPS_RELAY, smpsState ? LOW : HIGH);
 
@@ -355,8 +403,6 @@ void loop() {
     else if (statusPage == 1) {
       display.print(F("Grid:"));
       display.print(isGrid ? F("OK") : F("DOWN"));
-      
-      // සෝලර් වෝල්ටේජ් එක පෙන්වන අලුත් කොටස
       display.print(F(" | Sun:"));
       if (solVolt > 5.0) {
         display.print(solVolt, 1);
