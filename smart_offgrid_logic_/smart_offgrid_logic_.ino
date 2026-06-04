@@ -4,7 +4,7 @@
 #include <WiFi.h>          
 #include <WiFiUdp.h>
 #include <NTPClient.h>
-#include <RTClib.h>        // Adafruit RTClib ලයිබ්‍රරි එක
+#include <RTClib.h>        
 
 // OLED Display Settings
 #define SCREEN_WIDTH 128
@@ -19,7 +19,7 @@ RTC_DS3231 rtc;
 const char* ssid = "SLT FIBER";
 const char* password = "@Ashan20030118";
 
-// NTP Time Client Settings (Sri Lanka Time Zone: UTC +5:30)
+// NTP Time Client
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
 
@@ -27,17 +27,17 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
 // ESP32 PIN Definitions
 // ---------------------------------------------------------
 const int BATTERY_PIN = 34;   
+const int SOLAR_PIN   = 32; // දැන් මේක Analog පින් එකක් විදිහට පාවිච්චි වේ
+
 const int INV_RELAY   = 25;   
 const int SMPS_RELAY  = 26;   
-
-const int SOLAR_SENS  = 32;   
 const int GRID_SENS   = 33;   
 
 const int ECO_SWITCH    = 14; 
 const int PCUT_SWITCH   = 27; 
 const int MANUAL_SWITCH = 13; 
 
-// Voltage Divider Calibration
+// Voltage Divider Calibration (බැටරිය සහ සෝලර් දෙකටම සමාන අගයන්)
 const float R1 = 100000.0; 
 const float R2 = 10000.0;  
 const float V_REF = 3.21;   
@@ -59,7 +59,6 @@ int statusPage = 0;
 void setup() {
   Serial.begin(115200);
 
-  // ESP32 ADC Resolution settings
   analogSetAttenuation(ADC_11db);
 
   // Active-Low Relay Boot Glitch Fix
@@ -68,14 +67,11 @@ void setup() {
   pinMode(INV_RELAY, OUTPUT);
   pinMode(SMPS_RELAY, OUTPUT);
 
-  // Sensing and Switch Pins
-  pinMode(SOLAR_SENS, INPUT);
   pinMode(GRID_SENS, INPUT);
   pinMode(ECO_SWITCH, INPUT_PULLUP);
   pinMode(PCUT_SWITCH, INPUT_PULLUP);
   pinMode(MANUAL_SWITCH, INPUT_PULLUP);
 
-  // Initialize OLED
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
     Serial.println(F("SSD1306 allocation failed"));
     for(;;);
@@ -83,23 +79,28 @@ void setup() {
   display.clearDisplay();
   display.display();
 
-  // Initialize RTC
   if (!rtc.begin()) {
-    Serial.println("RTC සොයාගත නොහැකි විය!");
+    Serial.println("RTC Not Found!");
   }
 
-  // Connect to WiFi
   WiFi.begin(ssid, password);
-  
-  // Start NTP Client
   timeClient.begin();
 }
 
+// බැටරි වෝල්ටීයතාවය මැනීම
 float getBatteryVoltage() {
   int raw = analogRead(BATTERY_PIN);
   float v_out = (raw * V_REF) / 4095.0; 
   float v_bat = v_out * ((R1 + R2) / R2);
   return v_bat;
+}
+
+// සෝලර් වෝල්ටීයතාවය මැනීම (අලුත් ෆන්ක්ෂන් එක)
+float getSolarVoltage() {
+  int raw = analogRead(SOLAR_PIN);
+  float v_out = (raw * V_REF) / 4095.0; 
+  float v_sol = v_out * ((R1 + R2) / R2);
+  return v_sol;
 }
 
 void drawWiFiBars(int x, int y) {
@@ -109,10 +110,8 @@ void drawWiFiBars(int x, int y) {
     display.print("X");
     return;
   }
-
   long rssi = WiFi.RSSI();
   int bars = 0;
-
   if (rssi > -55) bars = 4;
   else if (rssi <= -55 && rssi > -65) bars = 3;
   else if (rssi <= -65 && rssi > -75) bars = 2;
@@ -127,25 +126,23 @@ void drawWiFiBars(int x, int y) {
 void loop() {
   String displayTime = "--:--";
 
-  // --- SMART TIME LOGIC (NTP vs RTC Fallback) ---
   if (WiFi.status() == WL_CONNECTED) {
     timeClient.update();
     displayTime = timeClient.getFormattedTime().substring(0, 5);
-    
-    // ඉන්ටර්නෙට් ඇති විට වෙලාව RTC මොඩියුලයට දමා Sync කරයි
     rtc.adjust(DateTime(timeClient.getEpochTime()));
   } else {
-    // ඉන්ටර්නෙට් නැති විට RTC එකෙන් වෙලාව ලබා ගනී
     DateTime now = rtc.now();
     char buf[] = "hh:mm";
     displayTime = String(now.toString(buf));
   }
 
   float batVolt = getBatteryVoltage();
-  bool isSolar = digitalRead(SOLAR_SENS);
+  float solVolt = getSolarVoltage(); // ලයිව් සෝලර් වෝල්ටේජ් එක
+  
+  // සෝලර් පැනල් එකෙන් 12V ට වඩා එනවා නම් විතරක් සෝලර් තියෙනවා (isSolar = true) ලෙස සලකයි
+  bool isSolar = (solVolt > 12.0); 
   bool isGrid = digitalRead(GRID_SENS);
   
-  // Active-LOW State Reading
   bool manualMode = (digitalRead(MANUAL_SWITCH) == LOW); 
   bool ecoMode   = manualMode ? false : (digitalRead(ECO_SWITCH) == LOW);
   bool pcutMode  = manualMode ? false : (digitalRead(PCUT_SWITCH) == LOW); 
@@ -197,9 +194,6 @@ void loop() {
     powerCutTime = 0; 
   }
 
-  // ---------------------------------------------------------
-  // CALCULATE DISPLAY COUNTDOWN SECONDS
-  // ---------------------------------------------------------
   int countdownSecs = -1;
   String countdownType = "";
 
@@ -281,7 +275,6 @@ void loop() {
     inverterState = false;
   }
 
-  // SMPS EXTRA CHARGER LOGIC
   bool allowCharging = (errorString == "") && isGrid && !inverterState && (ecoMode || pcutMode || modeString == "POWER OFF");
 
   if (allowCharging) {
@@ -295,7 +288,6 @@ void loop() {
     smpsState = false; 
   }
 
-  // Execute Relay Actions
   digitalWrite(INV_RELAY, inverterState ? LOW : HIGH);
   digitalWrite(SMPS_RELAY, smpsState ? LOW : HIGH);
 
@@ -316,7 +308,6 @@ void loop() {
     display.print(F("V"));
   }
 
-  // මෙතනට ලයිව් වෙලාව (NTP හෝ RTC එකෙන් එන) වැටේ
   display.setCursor(95, 1);
   display.print(displayTime);
   
@@ -364,8 +355,15 @@ void loop() {
     else if (statusPage == 1) {
       display.print(F("Grid:"));
       display.print(isGrid ? F("OK") : F("DOWN"));
+      
+      // සෝලර් වෝල්ටේජ් එක පෙන්වන අලුත් කොටස
       display.print(F(" | Sun:"));
-      display.print(isSolar ? F("YES") : F("NO"));
+      if (solVolt > 5.0) {
+        display.print(solVolt, 1);
+        display.print("V");
+      } else {
+        display.print("NO");
+      }
     } 
     else if (statusPage == 2) {
       display.print(F("Status: "));
