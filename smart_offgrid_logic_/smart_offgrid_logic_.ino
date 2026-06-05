@@ -163,7 +163,7 @@ void drawWiFiBars(int x, int y) {
 
 void loop() {
   String displayTime = "--:--";
-  int currentHour = 12; // වෙලාව පරීක්ෂා කිරීමට අලුතින් යෙදූ විචල්‍යය
+  int currentHour = 12; // වෙලාව පරීක්ෂා කිරීමට විචල්‍යය
 
   if (WiFi.status() == WL_CONNECTED) {
     timeClient.update();
@@ -207,7 +207,6 @@ void loop() {
       shouldRunGridReturnTimer = true; 
     }
     else if (ecoMode && pcutMode) {
-      // Updated Grid Return trigger for ECO Mode
       if (batVolt <= 14.2 || solVolt <= 14.0) {
         shouldRunGridReturnTimer = true;
       }
@@ -224,7 +223,6 @@ void loop() {
     gridReturnTime = 0;
   }
 
-  // UPDATED: Skip Power Cut Timer if in ECO mode (Instant Switch)
   if (!isGrid && !inverterState && pcutMode && !ecoMode) {
     if (!powerCutTimerActive) {
       powerCutTime = millis();
@@ -254,7 +252,7 @@ void loop() {
   }
 
   // ---------------------------------------------------------
-  // CORE AUTOMATION LOGIC (UPDATED WITH NEW RULES)
+  // CORE AUTOMATION LOGIC 
   // ---------------------------------------------------------
   if (errorString != "") {
     modeString = "ERROR";
@@ -275,11 +273,10 @@ void loop() {
         if (batVolt <= 12.0) inverterState = false; 
       } else {
         if (batVolt > 12.0) {
-          inverterState = true; // ක්ෂණිකව ON වේ
+          inverterState = true; 
         }
       }
     } else {
-      // Grid is OK: ECO Logic
       if (solVolt > 14.0 && batVolt >= 15.3) inverterState = true;
       
       if (batVolt <= 14.2 || (solVolt <= 14.0 && inverterState)) {
@@ -293,7 +290,6 @@ void loop() {
   } 
   else if (ecoMode) {
     modeString = "ECO MODE";
-    // Updated ECO Logic limits
     if (solVolt > 14.0 && batVolt >= 15.3) inverterState = true;
     if (batVolt <= 14.2) inverterState = false;
   } 
@@ -316,17 +312,21 @@ void loop() {
   }
 
   // ---------------------------------------------------------
-  // SMPS EXTRA CHARGER LOGIC (UPDATED 1AM & SOLAR LOGIC)
+  // ⚡ SMPS EXTRA CHARGER LOGIC (UPDATED WITH 6PM & 1AM)
   // ---------------------------------------------------------
   bool allowCharging = (errorString == "") && isGrid && !inverterState && (ecoMode || pcutMode || modeString == "POWER OFF");
 
   if (allowCharging) {
     
-    // 1. රාත්‍රී 1:00 අනිවාර්ය බැටරි ටොප්-අප් (Night Emergency Backup)
-    if (currentHour == 1 && batVolt < 13.8) {
+    // 1. හවස 6:00 අනිවාර්ය ටොප්-අප් (Evening Prep Logic)
+    if (currentHour == 18 && batVolt < 13.5) {
       smpsState = true;
     }
-    // 2. සාමාන්‍යයෙන් බැටරිය ගොඩක්ම අඩු වුණොත් චාජ් වීම
+    // 2. රාත්‍රී 1:00 අනිවාර්ය බැටරි ටොප්-අප් (Night Emergency Backup)
+    else if (currentHour == 1 && batVolt < 13.8) {
+      smpsState = true;
+    }
+    // 3. සාමාන්‍යයෙන් බැටරිය ගොඩක්ම අඩු වුණොත් චාජ් වීම
     else if (batVolt >= 12.0 && batVolt <= 12.5) {
       smpsState = true; 
     }
