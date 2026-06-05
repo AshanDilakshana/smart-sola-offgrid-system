@@ -40,7 +40,7 @@ const int MANUAL_SWITCH = 13;
 // Voltage Divider Calibration
 const float R1 = 100000.0; 
 const float R2 = 10000.0;  
-const float V_REF = 3.7385;   // ඔයාගේ අලුත් නිවැරදි කරපු කැලිබ්‍රේෂන් අගය
+const float V_REF = 3.7385;   
 
 // --- Easy Timer Configuration ---
 const unsigned long TIMER_DELAY_MS = 10000; 
@@ -59,15 +59,15 @@ int statusPage = 0;
 // --- Super Strong Noise Filter Variables ---
 float lastBatVolt = 0.0;
 float lastSolVolt = 0.0;
-const float VOLTAGE_DEADBAND = 0.1; // 0.1V ට වඩා අඩු වෙනස්කම් නොසලකා හරියි
+const float VOLTAGE_DEADBAND = 0.1; 
 
 void setup() {
   Serial.begin(115200);
 
-  // ADC එක 0-3.3V පරාසයට සකස් කිරීම
+  // ADC Settings
   analogSetAttenuation(ADC_11db);
 
-  // Active-Low Relay Boot Glitch Fix (ඉබේ ON වීම නැවැත්වීම)
+  // Active-Low Relay Boot Glitch Fix 
   digitalWrite(INV_RELAY, HIGH);
   digitalWrite(SMPS_RELAY, HIGH);
   pinMode(INV_RELAY, OUTPUT);
@@ -98,31 +98,27 @@ void setup() {
 }
 
 // ---------------------------------------------------------
-// 🛠️ NOISE FILTERED BATTERY VOLTAGE FUNCTION
+// 🛠️ NOISE FILTERED VOLTAGE FUNCTIONS
 // ---------------------------------------------------------
 float getBatteryVoltage() {
   long sum = 0;
-  int samples = 200; // සැරවල් 200ක් කියවා සාමාන්‍ය අගය ගනී
+  int samples = 200; 
   
   for (int i = 0; i < samples; i++) {
     sum += analogRead(BATTERY_PIN);
-    delayMicroseconds(50); // Wi-Fi Noise අහු නොවන ලෙස වේගයෙන් කියවයි
+    delayMicroseconds(50); 
   }
   
   float raw = (float)sum / samples;
   float v_out = (raw * V_REF) / 4095.0; 
   float newVolt = v_out * ((R1 + R2) / R2);
 
-  // Deadband Logic: වෙනස 0.1V ට වඩා අඩු නම්, පරණ අගයම තියාගන්නවා
   if (abs(newVolt - lastBatVolt) >= VOLTAGE_DEADBAND) {
     lastBatVolt = newVolt;
   }
   return lastBatVolt;
 }
 
-// ---------------------------------------------------------
-// 🛠️ NOISE FILTERED SOLAR VOLTAGE FUNCTION
-// ---------------------------------------------------------
 float getSolarVoltage() {
   long sum = 0;
   int samples = 200; 
@@ -168,25 +164,21 @@ void drawWiFiBars(int x, int y) {
 void loop() {
   String displayTime = "--:--";
 
-  // --- SMART TIME LOGIC (NTP vs RTC Fallback) ---
   if (WiFi.status() == WL_CONNECTED) {
     timeClient.update();
     displayTime = timeClient.getFormattedTime().substring(0, 5);
-    rtc.adjust(DateTime(timeClient.getEpochTime())); // Sync RTC with Web Time
+    rtc.adjust(DateTime(timeClient.getEpochTime())); 
   } else {
     DateTime now = rtc.now();
     char buf[] = "hh:mm";
     displayTime = String(now.toString(buf));
   }
 
-  // Get Filtered Voltages
   float batVolt = getBatteryVoltage();
   float solVolt = getSolarVoltage(); 
   
-  bool isSolar = (solVolt > 12.0); 
   bool isGrid = digitalRead(GRID_SENS);
   
-  // Active-LOW State Reading
   bool manualMode = (digitalRead(MANUAL_SWITCH) == LOW); 
   bool ecoMode   = manualMode ? false : (digitalRead(ECO_SWITCH) == LOW);
   bool pcutMode  = manualMode ? false : (digitalRead(PCUT_SWITCH) == LOW); 
@@ -212,7 +204,8 @@ void loop() {
       shouldRunGridReturnTimer = true; 
     }
     else if (ecoMode && pcutMode) {
-      if (batVolt <= 14.2 || !isSolar) {
+      // Updated Grid Return trigger for ECO Mode
+      if (batVolt <= 14.2 || solVolt <= 14.0) {
         shouldRunGridReturnTimer = true;
       }
     }
@@ -228,7 +221,8 @@ void loop() {
     gridReturnTime = 0;
   }
 
-  if (!isGrid && !inverterState && pcutMode) {
+  // UPDATED: Skip Power Cut Timer if in ECO mode (Instant Switch)
+  if (!isGrid && !inverterState && pcutMode && !ecoMode) {
     if (!powerCutTimerActive) {
       powerCutTime = millis();
       powerCutTimerActive = true;
@@ -257,7 +251,7 @@ void loop() {
   }
 
   // ---------------------------------------------------------
-  // CORE AUTOMATION LOGIC
+  // CORE AUTOMATION LOGIC (UPDATED WITH NEW RULES)
   // ---------------------------------------------------------
   if (errorString != "") {
     modeString = "ERROR";
@@ -273,17 +267,19 @@ void loop() {
     modeString = "ECO+POWER CUT"; 
     
     if (!isGrid) {
+      // Grid is down: Instant ON without countdown timer
       if (inverterState) {
         if (batVolt <= 12.0) inverterState = false; 
       } else {
-        if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt > 12.0) {
-          inverterState = true;
+        if (batVolt > 12.0) {
+          inverterState = true; // ක්ෂණිකව ON වේ
         }
       }
     } else {
-      if (isSolar && batVolt >= 15.4) inverterState = true;
+      // Grid is OK: ECO Logic
+      if (solVolt > 14.0 && batVolt >= 15.3) inverterState = true;
       
-      if (batVolt <= 14.2 || (!isSolar && inverterState)) {
+      if (batVolt <= 14.2 || (solVolt <= 14.0 && inverterState)) {
         if (gridReturnTimerActive) {
           if (millis() - gridReturnTime >= TIMER_DELAY_MS) inverterState = false;
         } else {
@@ -294,12 +290,9 @@ void loop() {
   } 
   else if (ecoMode) {
     modeString = "ECO MODE";
-    if (isSolar) {
-      if (batVolt >= 15.4) inverterState = true;
-      if (batVolt <= 14.2) inverterState = false;
-    } else {
-      inverterState = false; 
-    }
+    // Updated ECO Logic limits
+    if (solVolt > 14.0 && batVolt >= 15.3) inverterState = true;
+    if (batVolt <= 14.2) inverterState = false;
   } 
   else if (pcutMode) {
     modeString = "POWER CUT"; 
@@ -335,7 +328,7 @@ void loop() {
     smpsState = false; 
   }
 
-  // Execute Relay Actions (LOW = ON, HIGH = OFF)
+  // Execute Relay Actions
   digitalWrite(INV_RELAY, inverterState ? LOW : HIGH);
   digitalWrite(SMPS_RELAY, smpsState ? LOW : HIGH);
 
