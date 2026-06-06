@@ -163,18 +163,18 @@ void drawWiFiBars(int x, int y) {
 
 void loop() {
   String displayTime = "--:--";
-  int currentHour = 12; // වෙලාව පරීක්ෂා කිරීමට විචල්‍යය
+  int currentHour = 12; // Variable used to check the current hour
 
   if (WiFi.status() == WL_CONNECTED) {
     timeClient.update();
     displayTime = timeClient.getFormattedTime().substring(0, 5);
-    currentHour = timeClient.getHours(); // Wi-Fi හරහා පැය ලබා ගැනීම
+    currentHour = timeClient.getHours(); // Get current hour via Wi-Fi NTP
     rtc.adjust(DateTime(timeClient.getEpochTime())); 
   } else {
     DateTime now = rtc.now();
     char buf[] = "hh:mm";
     displayTime = String(now.toString(buf));
-    currentHour = now.hour(); // RTC හරහා පැය ලබා ගැනීම
+    currentHour = now.hour(); // Get current hour via RTC (fallback)
   }
 
   float batVolt = getBatteryVoltage();
@@ -318,25 +318,25 @@ void loop() {
 
   if (allowCharging) {
     
-    // 1. හවස 6:00 අනිවාර්ය ටොප්-අප් (Evening Prep Logic)
+    // 1. Mandatory 6:00 PM top-up charge (Evening Prep Logic)
     if (currentHour == 18 && batVolt < 13.5) {
       smpsState = true;
     }
-    // 2. රාත්‍රී 1:00 අනිවාර්ය බැටරි ටොප්-අප් (Night Emergency Backup)
+    // 2. Mandatory 1:00 AM battery top-up charge (Night Emergency Backup)
     else if (currentHour == 1 && batVolt < 13.8) {
       smpsState = true;
     }
-    // 3. සාමාන්‍යයෙන් බැටරිය ගොඩක්ම අඩු වුණොත් චාජ් වීම
+    // 3. Charge when battery level drops very low under normal conditions
     else if (batVolt >= 12.0 && batVolt <= 12.5) {
       smpsState = true; 
     }
 
     // --- SMPS OFF CONDITIONS ---
     if (batVolt >= 13.8) {
-      smpsState = false; // බැටරිය පිරුණු පසු ඕෆ් කරයි
+      smpsState = false; // Turn off SMPS once battery is fully charged
     }
     if (solVolt >= 10.0) {
-      smpsState = false; // ඉර පායා සෝලර් එකෙන් 10V ආපු ගමන් ක්ෂණිකව SMPS ඕෆ් කරයි
+      smpsState = false; // Instantly turn off SMPS when solar reaches 10V at sunrise
     }
     
   } else {
