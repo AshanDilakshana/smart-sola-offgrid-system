@@ -223,7 +223,8 @@ void loop() {
     gridReturnTime = 0;
   }
 
-  if (!isGrid && !inverterState && pcutMode && !ecoMode) {
+  // Power-cut timer: runs in PCUT and ECO+PCUT mode, but only when inverter is OFF
+  if (!isGrid && !inverterState && pcutMode) {
     if (!powerCutTimerActive) {
       powerCutTime = millis();
       powerCutTimerActive = true;
@@ -268,13 +269,15 @@ void loop() {
     modeString = "ECO+POWER CUT"; 
     
     if (!isGrid) {
-      // Grid is down: Instant ON without countdown timer
       if (inverterState) {
-        if (batVolt <= 12.0) inverterState = false; 
+        // Inverter was already ON (from ECO solar) when grid failed → skip countdown, stay ON
+        if (batVolt <= 12.0) inverterState = false;
       } else {
-        if (batVolt > 12.0) {
-          inverterState = true; 
+        // Inverter was OFF when grid failed → wait for 10s power-cut countdown
+        if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt > 12.0) {
+          inverterState = true;
         }
+        if (batVolt <= 12.0) inverterState = false;
       }
     } else {
       if (solVolt > 14.0 && batVolt >= 15.3) inverterState = true;
