@@ -54,6 +54,9 @@ bool powerCutTimerActive = false;
 bool gridReturnTimerActive = false;
 bool inverterState = false;
 bool smpsState = false;
+bool topup530Active = false;
+bool topup1amActive = false;
+bool normalChargingActive = false;
 int statusPage = 0; 
 
 // --- Super Strong Noise Filter Variables ---
@@ -164,17 +167,24 @@ void drawWiFiBars(int x, int y) {
 void loop() {
   String displayTime = "--:--";
   int currentHour = 12; // Variable used to check the current hour
+  int currentMinute = 0; // Variable used to check the current minute
 
   if (WiFi.status() == WL_CONNECTED) {
     timeClient.update();
     displayTime = timeClient.getFormattedTime().substring(0, 5);
     currentHour = timeClient.getHours(); // Get current hour via Wi-Fi NTP
-    rtc.adjust(DateTime(timeClient.getEpochTime())); 
+    currentMinute = timeClient.getMinutes(); // Get current minute via Wi-Fi NTP
+    static unsigned long lastRtcSync = 0;
+    if (millis() - lastRtcSync >= 3600000 || lastRtcSync == 0) {
+      rtc.adjust(DateTime(timeClient.getEpochTime())); 
+      lastRtcSync = millis();
+    }
   } else {
     DateTime now = rtc.now();
     char buf[] = "hh:mm";
     displayTime = String(now.toString(buf));
     currentHour = now.hour(); // Get current hour via RTC (fallback)
+    currentMinute = now.minute(); // Get current minute via RTC (fallback)
   }
 
   float batVolt = getBatteryVoltage();
@@ -315,40 +325,77 @@ void loop() {
   }
 
   // ---------------------------------------------------------
-  // ⚡ SMPS EXTRA CHARGER LOGIC (UPDATED WITH 6PM & 1AM)
+  // ⚡ SMPS EXTRA CHARGER LOGIC (UPDATED WITH 5:30PM & 1AM & ANYTIME)
   // ---------------------------------------------------------
-  bool allowCharging = (errorString == "") && isGrid && !inverterState && (ecoMode || pcutMode || modeString == "POWER OFF");
+  bool allowCharging = (errorString == "") && isGrid && !inverterState && !manualMode && (ecoMode || pcutMode || modeString == "POWER OFF");
 
   if (allowCharging) {
     
-    // 1. Mandatory 6:00 PM top-up charge (Evening Prep Logic)
-    if (currentHour == 18 && batVolt < 13.5) {
-      smpsState = true;
+    // 1. Mandatory 5:30 PM top-up charge (Evening Prep Logic)
+    // Triggers at 17:30 to 17:59 if battery is under 13.8V
+    if ((currentHour == 17 && currentMinute >= 30) && batVolt < 13.8 && !topup1amActive && !normalChargingActive) {
+      topup530Active = true;
     }
+    
     // 2. Mandatory 1:00 AM battery top-up charge (Night Emergency Backup)
-    else if (currentHour == 1 && batVolt < 13.8) {
-      smpsState = true;
+    // Triggers at 1:00 to 1:59 if battery is under 13.8V
+    if (currentHour == 1 && batVolt < 13.8 && !topup530Active && !normalChargingActive) {
+      topup1amActive = true;
     }
-    // 3. Charge when battery level drops very low under normal conditions
-    else if (batVolt >= 12.0 && batVolt <= 12.5) {
-      smpsState = true; 
+    
+    // 3. Charge when battery level drops very low under normal conditions (Anytime)
+    if (batVolt >= 12.0 && batVolt <= 12.5 && !topup530Active && !topup1amActive) {
+      normalChargingActive = true;
     }
 
-    // --- SMPS OFF CONDITIONS ---
-    if (batVolt >= 13.8) {
-      smpsState = false; // Turn off SMPS once battery is fully charged
+    // --- SMPS STATE EVALUATION & OFF CONDITIONS ---
+    if (topup530Active) {
+      smpsState = true;
+      if (batVolt >= 14.5) {
+        topup530Active = false;
+        smpsState = false;
+      }
     }
-    if (solVolt >= 10.0) {
-      smpsState = false; // Instantly turn off SMPS when solar reaches 10V at sunrise
+    else if (topup1amActive) {
+      smpsState = true;
+      if (solVolt >= 10.0) {
+        topup1amActive = false;
+        smpsState = false;
+      }
+    }
+    else if (normalChargingActive) {
+      smpsState = true;
+      if (batVolt >= 14.0) {
+        normalChargingActive = false;
+        smpsState = false;
+      }
+    }
+    else {
+      smpsState = false;
     }
     
   } else {
+    // Reset all charging states if charging is not allowed
+    topup530Active = false;
+    topup1amActive = false;
+    normalChargingActive = false;
     smpsState = false; 
   }
 
   // Execute Relay Actions
   digitalWrite(INV_RELAY, inverterState ? LOW : HIGH);
   digitalWrite(SMPS_RELAY, smpsState ? LOW : HIGH);
+
+  // Override display modeString if charging
+  if (smpsState) {
+    if (topup530Active) {
+      modeString = "5:30 TOPUP";
+    } else if (topup1amActive) {
+      modeString = "1AM TOPUP";
+    } else if (normalChargingActive) {
+      modeString = "SMPS CHG";
+    }
+  }
 
   // ---------------------------------------------------------
   // OLED DISPLAY GRAPHICS LAYOUT
