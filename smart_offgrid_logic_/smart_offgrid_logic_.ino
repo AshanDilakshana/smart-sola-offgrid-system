@@ -43,8 +43,8 @@ const float R2 = 10000.0;
 const float V_REF = 3.6565;   
 
 // --- Easy Timer Configuration ---
-const unsigned long TIMER_DELAY_MS = 10000; 
-const int TIMER_DELAY_SEC = 10;
+const unsigned long TIMER_DELAY_MS = 180000; 
+const int TIMER_DELAY_SEC = 180;
 
 // Timer, Toggle & State Variables
 unsigned long powerCutTime = 0;
@@ -290,7 +290,7 @@ void loop() {
         if (batVolt <= 12.0) inverterState = false;
       } else {
         // Inverter was OFF when grid failed → wait for 10s power-cut countdown
-        if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt > 12.0) {
+        if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt >= 12.5) {
           inverterState = true;
         }
         if (batVolt <= 12.0) inverterState = false;
@@ -315,7 +315,7 @@ void loop() {
   else if (pcutMode) {
     modeString = "POWER CUT"; 
     if (!isGrid) {
-      if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt > 12.0) {
+      if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt >= 12.5) {
         inverterState = true;
       }
       if (batVolt <= 12.0) inverterState = false; 
