@@ -40,7 +40,7 @@ const int MANUAL_SWITCH = 13;
 // Voltage Divider Calibration
 const float R1 = 100000.0; 
 const float R2 = 10000.0;  
-const float V_REF = 3.7385;   
+const float V_REF = 3.6565;   
 
 // --- Easy Timer Configuration ---
 const unsigned long TIMER_DELAY_MS = 10000; 
@@ -116,8 +116,11 @@ float getBatteryVoltage() {
   float v_out = (raw * V_REF) / 4095.0; 
   float newVolt = v_out * ((R1 + R2) / R2);
 
-  if (abs(newVolt - lastBatVolt) >= VOLTAGE_DEADBAND) {
+  // EMA Low-Pass Filter for high stability
+  if (lastBatVolt == 0.0) {
     lastBatVolt = newVolt;
+  } else {
+    lastBatVolt = (0.05 * newVolt) + (0.95 * lastBatVolt);
   }
   return lastBatVolt;
 }
@@ -135,8 +138,11 @@ float getSolarVoltage() {
   float v_out = (raw * V_REF) / 4095.0; 
   float newVolt = v_out * ((R1 + R2) / R2);
 
-  if (abs(newVolt - lastSolVolt) >= VOLTAGE_DEADBAND) {
+  // EMA Low-Pass Filter for high stability
+  if (lastSolVolt == 0.0) {
     lastSolVolt = newVolt;
+  } else {
+    lastSolVolt = (0.05 * newVolt) + (0.95 * lastSolVolt);
   }
   return lastSolVolt;
 }
