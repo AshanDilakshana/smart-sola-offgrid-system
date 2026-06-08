@@ -46,6 +46,11 @@ const float V_REF = 3.6565;
 const unsigned long TIMER_DELAY_MS = 180000; 
 const int TIMER_DELAY_SEC = 180;
 
+// --- Charging Voltage Configuration ---
+const float BAT_CHARGE_START_THRESHOLD = 12.5; // Start normal charging below this voltage (Default: 12.5V)
+const float BAT_CHARGE_STOP_THRESHOLD  = 15.6; // Stop charging when battery reaches this voltage
+const float BAT_TOPUP_START_THRESHOLD  = 14.5; // Start top-up charging if battery drops below this voltage
+
 // Timer, Toggle & State Variables
 unsigned long powerCutTime = 0;
 unsigned long gridReturnTime = 0;
@@ -57,12 +62,19 @@ bool smpsState = false;
 bool topup530Active = false;
 bool topup1amActive = false;
 bool normalChargingActive = false;
+bool topup530Done = false;         // Prevents evening top-up from looping
+bool topup1amDone = false;         // Prevents morning top-up from looping
 int statusPage = 0; 
+
+// --- Software Grid Debounce Variables ---
+unsigned long lastGridDebounceTime = 0;
+bool lastGridRawState = false;
+bool debouncedGridState = false;
+const unsigned long GRID_DEBOUNCE_DELAY_MS = 1000; // 1 second debounce to filter grid noise
 
 // --- Super Strong Noise Filter Variables ---
 float lastBatVolt = 0.0;
 float lastSolVolt = 0.0;
-const float VOLTAGE_DEADBAND = 0.1; 
 
 void setup() {
   Serial.begin(115200);
@@ -95,6 +107,10 @@ void setup() {
     Serial.println("RTC Not Found!");
   }
 
+  // Initialize debounced grid state to avoid 1-second false power-cut at boot
+  lastGridRawState = digitalRead(GRID_SENS);
+  debouncedGridState = lastGridRawState;
+
   // Connect to WiFi
   WiFi.begin(ssid, password);
   timeClient.begin();
@@ -126,6 +142,9 @@ float getBatteryVoltage() {
 }
 
 float getSolarVoltage() {
+  // Solar panels are disconnected. Return 0.0V to prevent floating pin readings.
+  return 0.0;
+  /*
   long sum = 0;
   int samples = 200; 
   
@@ -145,6 +164,7 @@ float getSolarVoltage() {
     lastSolVolt = (0.05 * newVolt) + (0.95 * lastSolVolt);
   }
   return lastSolVolt;
+  */
 }
 
 // ---------------------------------------------------------
@@ -182,8 +202,11 @@ void loop() {
     currentMinute = timeClient.getMinutes(); // Get current minute via Wi-Fi NTP
     static unsigned long lastRtcSync = 0;
     if (millis() - lastRtcSync >= 3600000 || lastRtcSync == 0) {
-      rtc.adjust(DateTime(timeClient.getEpochTime())); 
-      lastRtcSync = millis();
+      unsigned long epoch = timeClient.getEpochTime();
+      if (epoch > 1767225600) { // Only adjust if time is valid (post-2026)
+        rtc.adjust(DateTime(epoch)); 
+        lastRtcSync = millis();
+      }
     }
   } else {
     DateTime now = rtc.now();
@@ -196,7 +219,16 @@ void loop() {
   float batVolt = getBatteryVoltage();
   float solVolt = getSolarVoltage(); 
   
-  bool isGrid = digitalRead(GRID_SENS);
+  // Software debounce for Grid Sensing to prevent noise triggers
+  bool gridRaw = digitalRead(GRID_SENS);
+  if (gridRaw != lastGridRawState) {
+    lastGridDebounceTime = millis();
+    lastGridRawState = gridRaw;
+  }
+  if ((millis() - lastGridDebounceTime) >= GRID_DEBOUNCE_DELAY_MS) {
+    debouncedGridState = gridRaw;
+  }
+  bool isGrid = debouncedGridState;
   
   bool manualMode = (digitalRead(MANUAL_SWITCH) == LOW); 
   bool ecoMode   = manualMode ? false : (digitalRead(ECO_SWITCH) == LOW);
@@ -219,13 +251,9 @@ void loop() {
   // ---------------------------------------------------------
   bool shouldRunGridReturnTimer = false;
   if (isGrid && inverterState) {
-    if (pcutMode && !ecoMode) {
+    // In battery backup mode, always run grid return timer to switch back to grid power
+    if (pcutMode || ecoMode) {
       shouldRunGridReturnTimer = true; 
-    }
-    else if (ecoMode && pcutMode) {
-      if (batVolt <= 14.2 || solVolt <= 14.0) {
-        shouldRunGridReturnTimer = true;
-      }
     }
   }
 
@@ -286,31 +314,33 @@ void loop() {
     
     if (!isGrid) {
       if (inverterState) {
-        // Inverter was already ON (from ECO solar) when grid failed → skip countdown, stay ON
+        // Inverter was already ON when grid failed → skip countdown, stay ON
         if (batVolt <= 12.0) inverterState = false;
       } else {
-        // Inverter was OFF when grid failed → wait for 10s power-cut countdown
+        // Inverter was OFF when grid failed → wait for countdown
         if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt >= 12.5) {
           inverterState = true;
         }
         if (batVolt <= 12.0) inverterState = false;
       }
     } else {
+      // Solar logic commented out: In battery backup mode, inverter remains OFF when grid is present
+      /*
       if (solVolt > 14.0 && batVolt >= 15.3) inverterState = true;
-      
-      if (batVolt <= 14.2 || (solVolt <= 14.0 && inverterState)) {
-        if (gridReturnTimerActive) {
-          if (millis() - gridReturnTime >= TIMER_DELAY_MS) inverterState = false;
-        } else {
-          inverterState = false;
-        }
+      */
+      if (gridReturnTimerActive && (millis() - gridReturnTime >= TIMER_DELAY_MS)) {
+        inverterState = false;
       }
     }
   } 
   else if (ecoMode) {
     modeString = "ECO MODE";
+    // Solar logic commented out: In battery backup mode, inverter remains OFF when grid is present
+    /*
     if (solVolt > 14.0 && batVolt >= 15.3) inverterState = true;
     if (batVolt <= 14.2) inverterState = false;
+    */
+    inverterState = false;
   } 
   else if (pcutMode) {
     modeString = "POWER CUT"; 
@@ -331,47 +361,57 @@ void loop() {
   }
 
   // ---------------------------------------------------------
-  // ⚡ SMPS EXTRA CHARGER LOGIC (UPDATED WITH 5:30PM & 1AM & ANYTIME)
+  // ⚡ SMPS EXTRA CHARGER LOGIC (WITH PREVENT LOOPING & GRID DEBOUNCE)
   // ---------------------------------------------------------
   bool allowCharging = (errorString == "") && isGrid && !inverterState && !manualMode && (ecoMode || pcutMode || modeString == "POWER OFF");
+
+  // Reset top-up Done flags when we are outside the respective time windows
+  if (currentHour != 17) {
+    topup530Done = false;
+  }
+  if (currentHour != 1) {
+    topup1amDone = false;
+  }
 
   if (allowCharging) {
     
     // 1. Mandatory 5:30 PM top-up charge (Evening Prep Logic)
-    // Triggers at 17:30 to 17:59 if battery is under 13.8V
-    if ((currentHour == 17 && currentMinute >= 30) && batVolt < 13.8 && !topup1amActive && !normalChargingActive) {
+    // Triggers at 17:30 to 17:59 if battery is under target and not done today
+    if ((currentHour == 17 && currentMinute >= 30) && batVolt < BAT_TOPUP_START_THRESHOLD && !topup530Done && !topup1amActive && !normalChargingActive) {
       topup530Active = true;
     }
     
     // 2. Mandatory 1:00 AM battery top-up charge (Night Emergency Backup)
-    // Triggers at 1:00 to 1:59 if battery is under 13.8V
-    if (currentHour == 1 && batVolt < 13.8 && !topup530Active && !normalChargingActive) {
+    // Triggers at 1:00 to 1:59 if battery is under target and not done today
+    if (currentHour == 1 && batVolt < BAT_TOPUP_START_THRESHOLD && !topup1amDone && !topup530Active && !normalChargingActive) {
       topup1amActive = true;
     }
     
-    // 3. Charge when battery level drops very low under normal conditions (Anytime)
-    if (batVolt >= 12.0 && batVolt <= 12.5 && !topup530Active && !topup1amActive) {
+    // 3. Charge when battery level drops below normal threshold (Anytime)
+    if (batVolt <= BAT_CHARGE_START_THRESHOLD && !topup530Active && !topup1amActive) {
       normalChargingActive = true;
     }
 
     // --- SMPS STATE EVALUATION & OFF CONDITIONS ---
     if (topup530Active) {
       smpsState = true;
-      if (batVolt >= 14.5) {
+      if (batVolt >= BAT_CHARGE_STOP_THRESHOLD) {
         topup530Active = false;
+        topup530Done = true; // Mark as done to prevent looping within the hour
         smpsState = false;
       }
     }
     else if (topup1amActive) {
       smpsState = true;
-      if (solVolt >= 10.0) {
+      if (batVolt >= BAT_CHARGE_STOP_THRESHOLD) {
         topup1amActive = false;
+        topup1amDone = true; // Mark as done to prevent looping within the hour
         smpsState = false;
       }
     }
     else if (normalChargingActive) {
       smpsState = true;
-      if (batVolt >= 14.0) {
+      if (batVolt >= BAT_CHARGE_STOP_THRESHOLD) {
         normalChargingActive = false;
         smpsState = false;
       }
