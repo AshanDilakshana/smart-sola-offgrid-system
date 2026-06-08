@@ -289,7 +289,7 @@ void loop() {
         // Inverter was already ON (from ECO solar) when grid failed → skip countdown, stay ON
         if (batVolt <= 12.0) inverterState = false;
       } else {
-        // Inverter was OFF when grid failed → wait for 10s power-cut countdown
+        // Inverter was OFF when grid failed → wait for power-cut countdown
         if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt >= 12.5) {
           inverterState = true;
         }
@@ -298,7 +298,9 @@ void loop() {
     } else {
       if (solVolt > 14.0 && batVolt >= 15.3) inverterState = true;
       
-      if (batVolt <= 14.2 || (solVolt <= 14.0 && inverterState)) {
+      if (batVolt <= 12.0) {
+        inverterState = false;
+      } else if (batVolt <= 14.2 || (solVolt <= 14.0 && inverterState)) {
         if (gridReturnTimerActive) {
           if (millis() - gridReturnTime >= TIMER_DELAY_MS) inverterState = false;
         } else {
@@ -320,7 +322,9 @@ void loop() {
       }
       if (batVolt <= 12.0) inverterState = false; 
     } else {
-      if (gridReturnTimerActive && (millis() - gridReturnTime >= TIMER_DELAY_MS)) {
+      if (batVolt <= 12.0) {
+        inverterState = false;
+      } else if (gridReturnTimerActive && (millis() - gridReturnTime >= TIMER_DELAY_MS)) {
         inverterState = false; 
       }
     }
@@ -350,7 +354,7 @@ void loop() {
     }
     
     // 3. Charge when battery level drops very low under normal conditions (Anytime)
-    if (batVolt >= 12.0 && batVolt <= 12.5 && !topup530Active && !topup1amActive) {
+    if (batVolt <= 12.5 && batVolt >= 5.0 && !topup530Active && !topup1amActive) {
       normalChargingActive = true;
     }
 
@@ -364,7 +368,7 @@ void loop() {
     }
     else if (topup1amActive) {
       smpsState = true;
-      if (solVolt >= 10.0) {
+      if (solVolt >= 10.0 || batVolt >= 14.5) {
         topup1amActive = false;
         smpsState = false;
       }
