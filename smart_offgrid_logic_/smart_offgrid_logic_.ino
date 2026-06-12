@@ -40,7 +40,8 @@ const int MANUAL_SWITCH = 13;
 // Voltage Divider Calibration
 const float R1 = 100000.0; 
 const float R2 = 10000.0;  
-const float V_REF = 3.6565;   
+const float V_REF = 3.7589;   // Recalibrated: 3.7784 * (15.47 / 15.55)
+const float CHARGING_OFFSET = 0.5; // Offset to subtract when SMPS charging is active (surface charge correction)
 
 // --- Easy Timer Configuration ---
 const unsigned long TIMER_DELAY_MS = 180000; 
@@ -48,7 +49,7 @@ const int TIMER_DELAY_SEC = 180;
 
 // --- Charging Voltage Configuration ---
 const float BAT_CHARGE_START_THRESHOLD = 12.5; // Start normal charging below this voltage (Default: 12.5V)
-const float BAT_CHARGE_STOP_THRESHOLD  = 15.6; // Stop charging when battery reaches this voltage
+const float BAT_CHARGE_STOP_THRESHOLD  = 15.5; // Stop charging when battery reaches this voltage (Below inverter OVP 15.5V)
 const float BAT_TOPUP_START_THRESHOLD  = 14.5; // Start top-up charging if battery drops below this voltage
 
 // Timer, Toggle & State Variables
@@ -65,6 +66,13 @@ bool normalChargingActive = false;
 bool topup530Done = false;         // Prevents evening top-up from looping
 bool topup1amDone = false;         // Prevents morning top-up from looping
 int statusPage = 0; 
+
+// --- Flatline Detection (dV/dt) Variables ---
+unsigned long lastVoltageCheckTime = 0;
+float lastRecordedVoltage = 0.0;
+bool flatlineDetected = false;
+const unsigned long VOLTAGE_CHECK_INTERVAL = 1200000; // 20 minutes
+const float DVDT_START_VOLTAGE = 14.5; // Only check after reaching 14.5V
 
 // --- Software Grid Debounce Variables ---
 unsigned long lastGridDebounceTime = 0;
@@ -131,6 +139,11 @@ float getBatteryVoltage() {
   float raw = (float)sum / samples;
   float v_out = (raw * V_REF) / 4095.0; 
   float newVolt = v_out * ((R1 + R2) / R2);
+
+  // Apply calibration offset if charger is active (compensation for voltage rise under charge)
+  if (smpsState) {
+    newVolt -= CHARGING_OFFSET;
+  }
 
   // EMA Low-Pass Filter for high stability
   if (lastBatVolt == 0.0) {
@@ -392,10 +405,36 @@ void loop() {
       normalChargingActive = true;
     }
 
+    // --- Flatline Detection Logic ---
+    if (topup530Active || topup1amActive || normalChargingActive) {
+      if (batVolt >= DVDT_START_VOLTAGE) {
+        if (lastRecordedVoltage == 0.0) {
+          lastRecordedVoltage = batVolt;
+          lastVoltageCheckTime = millis();
+          flatlineDetected = false;
+        } else {
+          if (millis() - lastVoltageCheckTime >= VOLTAGE_CHECK_INTERVAL) {
+            // Check if voltage is not higher than the previous value
+            if (batVolt <= lastRecordedVoltage) {
+              flatlineDetected = true; // Not increased, SMPS cut off
+            }
+            lastRecordedVoltage = batVolt;
+            lastVoltageCheckTime = millis();
+          }
+        }
+      } else {
+        lastRecordedVoltage = 0.0;
+        flatlineDetected = false;
+      }
+    } else {
+      lastRecordedVoltage = 0.0;
+      flatlineDetected = false;
+    }
+
     // --- SMPS STATE EVALUATION & OFF CONDITIONS ---
     if (topup530Active) {
       smpsState = true;
-      if (batVolt >= BAT_CHARGE_STOP_THRESHOLD) {
+      if (batVolt >= BAT_CHARGE_STOP_THRESHOLD || flatlineDetected) {
         topup530Active = false;
         topup530Done = true; // Mark as done to prevent looping within the hour
         smpsState = false;
@@ -403,7 +442,7 @@ void loop() {
     }
     else if (topup1amActive) {
       smpsState = true;
-      if (batVolt >= BAT_CHARGE_STOP_THRESHOLD) {
+      if (batVolt >= BAT_CHARGE_STOP_THRESHOLD || flatlineDetected) {
         topup1amActive = false;
         topup1amDone = true; // Mark as done to prevent looping within the hour
         smpsState = false;
@@ -411,7 +450,7 @@ void loop() {
     }
     else if (normalChargingActive) {
       smpsState = true;
-      if (batVolt >= BAT_CHARGE_STOP_THRESHOLD) {
+      if (batVolt >= BAT_CHARGE_STOP_THRESHOLD || flatlineDetected) {
         normalChargingActive = false;
         smpsState = false;
       }
