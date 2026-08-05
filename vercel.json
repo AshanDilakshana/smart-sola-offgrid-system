@@ -1,0 +1,7 @@
+{
+  "buildCommand": "cd smart_offgrid_logic_/frontend && npm install && npm run build",
+  "outputDirectory": "smart_offgrid_logic_/frontend/dist",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}
