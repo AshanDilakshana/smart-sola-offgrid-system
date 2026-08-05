@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Zap,
   Sun,
@@ -15,6 +15,8 @@ import {
   FileText,
   SlidersHorizontal,
   ChevronRight,
+  TrendingDown,
+  Clock3,
   CloudLightning,
   Gauge,
   PlugZap,
@@ -41,6 +43,13 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [logs, setLogs] = useState([]);
 
+  // Inverter uptime tracking
+  const [inverterOnTime, setInverterOnTime] = useState(0); // seconds
+  const [inverterSessions, setInverterSessions] = useState([]); // [{start, end, duration}]
+  const inverterTimerRef = useRef(null);
+  const prevInverterState = useRef(null);
+  const inverterStartRef = useRef(null);
+
   const addLog = (msg, type = 'info') => {
     const time = new Date().toLocaleTimeString();
     setLogs(prev => [{ id: Date.now() + Math.random(), time, msg, type }, ...prev.slice(0, 49)]);
@@ -58,14 +67,123 @@ export default function App() {
         setStatus(data);
         setHistory(prev => {
           const next = [...prev, { time: new Date().toLocaleTimeString(), volt: data.batteryVoltage }];
-          return next.slice(-25);
+          return next.slice(-60); // Keep 2 minutes of data (60 samples at 2s intervals)
         });
+
+        // Track inverter ON/OFF transitions
+        const isOn = !!data.inverterState;
+        if (prevInverterState.current !== isOn) {
+          if (isOn) {
+            // Inverter just turned ON
+            inverterStartRef.current = Date.now();
+            inverterTimerRef.current = setInterval(() => {
+              setInverterOnTime(prev => prev + 1);
+            }, 1000);
+          } else if (prevInverterState.current === true) {
+            // Inverter just turned OFF
+            if (inverterTimerRef.current) clearInterval(inverterTimerRef.current);
+            const duration = inverterStartRef.current ? Math.round((Date.now() - inverterStartRef.current) / 1000) : 0;
+            if (duration > 0) {
+              setInverterSessions(prev => [
+                { start: new Date(inverterStartRef.current).toLocaleTimeString(), duration },
+                ...prev.slice(0, 9)
+              ]);
+            }
+          }
+          prevInverterState.current = isOn;
+        }
       }
     }
     updateStatus();
     const interval = setInterval(updateStatus, 2000);
-    return () => { isMounted = false; clearInterval(interval); };
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+      if (inverterTimerRef.current) clearInterval(inverterTimerRef.current);
+    };
   }, [esp32Ip, connectionMode]);
+
+  // Format seconds to HH:MM:SS
+  const formatTime = (totalSec) => {
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  };
+
+  // SVG Sparkline chart renderer
+  const renderVoltageChart = () => {
+    if (history.length < 2) return null;
+    const W = 600, H = 120, padX = 40, padY = 15;
+    const voltages = history.map(h => h.volt);
+    const minV = Math.min(...voltages) - 0.3;
+    const maxV = Math.max(...voltages) + 0.3;
+    const rangeV = maxV - minV || 1;
+    const chartW = W - padX * 2;
+    const chartH = H - padY * 2;
+
+    const points = history.map((h, i) => {
+      const x = padX + (i / (history.length - 1)) * chartW;
+      const y = padY + chartH - ((h.volt - minV) / rangeV) * chartH;
+      return `${x},${y}`;
+    });
+
+    const areaPoints = [
+      `${padX},${padY + chartH}`,
+      ...points,
+      `${padX + chartW},${padY + chartH}`
+    ].join(' ');
+
+    // Grid lines
+    const gridLines = [];
+    const steps = 4;
+    for (let i = 0; i <= steps; i++) {
+      const y = padY + (i / steps) * chartH;
+      const v = maxV - (i / steps) * rangeV;
+      gridLines.push({ y, label: v.toFixed(1) });
+    }
+
+    return (
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: '100%' }}>
+        {/* Grid lines */}
+        {gridLines.map((gl, i) => (
+          <g key={i}>
+            <line x1={padX} y1={gl.y} x2={W - padX} y2={gl.y} stroke="rgba(255,255,255,0.05)" strokeWidth="1" />
+            <text x={padX - 6} y={gl.y + 3} fill="var(--text-dim)" fontSize="8" textAnchor="end" fontFamily="var(--font-mono)">{gl.label}</text>
+          </g>
+        ))}
+        {/* Area fill */}
+        <defs>
+          <linearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="rgba(56, 189, 248, 0.25)" />
+            <stop offset="100%" stopColor="rgba(56, 189, 248, 0.0)" />
+          </linearGradient>
+        </defs>
+        <polygon points={areaPoints} fill="url(#chartGrad)" />
+        {/* Line */}
+        <polyline
+          points={points.join(' ')}
+          fill="none"
+          stroke="var(--accent-cyan)"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          style={{ filter: 'drop-shadow(0 0 4px rgba(56, 189, 248, 0.4))' }}
+        />
+        {/* Latest point dot */}
+        {history.length > 0 && (() => {
+          const lastPt = points[points.length - 1].split(',');
+          return (
+            <circle cx={lastPt[0]} cy={lastPt[1]} r="3.5" fill="var(--accent-cyan)" stroke="#fff" strokeWidth="1.5">
+              <animate attributeName="r" values="3.5;5;3.5" dur="2s" repeatCount="indefinite" />
+            </circle>
+          );
+        })()}
+      </svg>
+    );
+  };
 
   const handleModeChange = async (modeVal) => {
     setLoading(true);
@@ -374,6 +492,70 @@ export default function App() {
               </div>
               <div className="card-value">0.0<span style={{ fontSize: '0.9rem', color: 'var(--text-muted)', fontWeight: 500 }}> V</span></div>
               <div className="card-subtitle">PV Sensor disconnected</div>
+            </div>
+          </div>
+
+          {/* ====== CHARTS SECTION ====== */}
+          <div className="charts-grid">
+            {/* Battery Voltage History Graph */}
+            <div className="glass-card chart-card">
+              <div className="card-header">
+                <span className="card-label">Battery Voltage History</span>
+                <TrendingDown size={16} color="var(--accent-cyan)" />
+              </div>
+              <div className="chart-container">
+                {history.length < 2 ? (
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)', fontSize: '0.78rem' }}>
+                    Collecting data...
+                  </div>
+                ) : renderVoltageChart()}
+              </div>
+              <div className="chart-footer">
+                <span>{history.length} samples</span>
+                <span>Live 2s interval</span>
+              </div>
+            </div>
+
+            {/* Inverter Uptime Tracker */}
+            <div className="glass-card chart-card">
+              <div className="card-header">
+                <span className="card-label">Inverter Uptime</span>
+                <Clock3 size={16} color={status?.inverterState ? 'var(--accent-green)' : 'var(--text-muted)'} />
+              </div>
+
+              {/* Current session timer */}
+              <div className="inverter-timer-display">
+                <div className={`inverter-timer-value ${status?.inverterState ? 'active' : ''}`}>
+                  {status?.inverterState && <div className="pulse-dot green" style={{ marginRight: '0.5rem' }}></div>}
+                  {formatTime(inverterOnTime)}
+                </div>
+                <div className="inverter-timer-label">
+                  {status?.inverterState ? 'Running now' : 'Inverter OFF'}
+                </div>
+              </div>
+
+              {/* Session history bars */}
+              <div className="inverter-sessions">
+                {inverterSessions.length === 0 ? (
+                  <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', textAlign: 'center', padding: '0.5rem 0' }}>
+                    No completed sessions yet
+                  </div>
+                ) : (
+                  inverterSessions.map((s, i) => {
+                    const maxDur = Math.max(...inverterSessions.map(x => x.duration), 1);
+                    const barWidth = Math.max(8, (s.duration / maxDur) * 100);
+                    return (
+                      <div key={i} className="session-row">
+                        <span className="session-time">{s.start}</span>
+                        <div className="session-bar-track">
+                          <div className="session-bar-fill" style={{ width: `${barWidth}%` }}></div>
+                        </div>
+                        <span className="session-duration">{formatTime(s.duration)}</span>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
             </div>
           </div>
         </div>
