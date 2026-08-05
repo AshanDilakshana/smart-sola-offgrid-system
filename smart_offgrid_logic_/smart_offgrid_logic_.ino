@@ -5,6 +5,10 @@
 #include <WiFiUdp.h>
 #include <NTPClient.h>
 #include <RTClib.h>        
+#include <WebServer.h>     
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <WiFiClientSecure.h>
 
 // OLED Display Settings
 #define SCREEN_WIDTH 128
@@ -19,9 +23,15 @@ RTC_DS3231 rtc;
 const char* ssid = "SLT FIBER";
 const char* password = "@Ashan20030118";
 
+// Firmware Versioning
+const char* FIRMWARE_VERSION = "v1.0.1";
+
 // NTP Time Client
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+
+// Web Server on Port 80
+WebServer server(80);
 
 // ---------------------------------------------------------
 // ESP32 PIN Definitions
@@ -66,12 +76,20 @@ bool normalChargingActive = false;
 bool topup530Done = false;         // Prevents evening top-up from looping
 bool topup1amDone = false;         // Prevents morning top-up from looping
 int statusPage = 0; 
+String currentModeString = "POWER OFF";
+
+// Web Control & Override Variables
+// webModeOverride: -1 = Auto (Physical Switches), 0 = POWER OFF, 1 = ECO MODE, 2 = POWER CUT, 3 = ECO+POWER CUT, 4 = MANUAL
+int webModeOverride = -1;
+bool forceChargingActive = false;
+bool manualInverterOverride = false;
+bool manualSmpsOverride = false;
 
 // --- Flatline Detection (dV/dt) Variables ---
 unsigned long lastVoltageCheckTime = 0;
 float lastRecordedVoltage = 0.0;
 bool flatlineDetected = false;
-const unsigned long VOLTAGE_CHECK_INTERVAL = 1200000; // 20 minutes
+const unsigned long VOLTAGE_CHECK_INTERVAL = 600000; // 10 minutes (600,000 ms)
 const float DVDT_START_VOLTAGE = 14.5; // Only check after reaching 14.5V
 
 // --- Software Grid Debounce Variables ---
@@ -83,6 +101,20 @@ const unsigned long GRID_DEBOUNCE_DELAY_MS = 1000; // 1 second debounce to filte
 // --- Super Strong Noise Filter Variables ---
 float lastBatVolt = 0.0;
 float lastSolVolt = 0.0;
+
+// Function declarations for API
+void handleGetStatus();
+void handleSetMode();
+void handleSetCharge();
+void handleSetRelay();
+void handleOTAUpdate();
+void syncFirebaseTask(void * pvParameters);
+
+unsigned long lastAppHeartbeatTime = 0;
+String lastReceivedHeartbeatStr = ""; // To track if the heartbeat timestamp actually changed
+const unsigned long ACTIVE_SESSION_TIMEOUT_MS = 10800000; // 3 Hours (10,800,000 ms)
+bool isAppSessionActive = true;
+TaskHandle_t FirebaseTaskHandle;
 
 void setup() {
   Serial.begin(115200);
@@ -122,6 +154,32 @@ void setup() {
   // Connect to WiFi
   WiFi.begin(ssid, password);
   timeClient.begin();
+
+  // Configure Web Server & CORS
+  server.enableCORS(true);
+  server.on("/api/status", HTTP_GET, handleGetStatus);
+  server.on("/api/mode", HTTP_POST, handleSetMode);
+  server.on("/api/mode", HTTP_GET, handleSetMode);
+  server.on("/api/charge", HTTP_POST, handleSetCharge);
+  server.on("/api/charge", HTTP_GET, handleSetCharge);
+  server.on("/api/relay", HTTP_POST, handleSetRelay);
+  server.on("/api/relay", HTTP_GET, handleSetRelay);
+  server.on("/api/ota-update", HTTP_POST, handleOTAUpdate);
+  server.on("/api/ota-update", HTTP_GET, handleOTAUpdate);
+  server.begin();
+  Serial.println("HTTP Web Server Started");
+
+  // Start Firebase Cloud Sync as a FreeRTOS Background Task on Core 0 (Network Core)
+  // This prevents the slow HTTPS handshakes from blocking the main loop (OLED & Switches)
+  xTaskCreatePinnedToCore(
+    syncFirebaseTask,   // Task function
+    "FirebaseTask",     // Name of task
+    8192,               // Stack size (8KB for HTTPS)
+    NULL,               // Parameter
+    1,                  // Priority
+    &FirebaseTaskHandle,// Task handle
+    0                   // Pin to Core 0
+  );
 }
 
 // ---------------------------------------------------------
@@ -157,27 +215,6 @@ float getBatteryVoltage() {
 float getSolarVoltage() {
   // Solar panels are disconnected. Return 0.0V to prevent floating pin readings.
   return 0.0;
-  /*
-  long sum = 0;
-  int samples = 200; 
-  
-  for (int i = 0; i < samples; i++) {
-    sum += analogRead(SOLAR_PIN);
-    delayMicroseconds(50);
-  }
-  
-  float raw = (float)sum / samples;
-  float v_out = (raw * V_REF) / 4095.0; 
-  float newVolt = v_out * ((R1 + R2) / R2);
-
-  // EMA Low-Pass Filter for high stability
-  if (lastSolVolt == 0.0) {
-    lastSolVolt = newVolt;
-  } else {
-    lastSolVolt = (0.05 * newVolt) + (0.95 * lastSolVolt);
-  }
-  return lastSolVolt;
-  */
 }
 
 // ---------------------------------------------------------
@@ -203,20 +240,190 @@ void drawWiFiBars(int x, int y) {
   if (bars >= 4) display.fillRect(x + 9, y,     2, 8, SSD1306_WHITE);
 }
 
+// ---------------------------------------------------------
+// 🌐 WEB SERVER API HANDLERS
+// ---------------------------------------------------------
+void handleGetStatus() {
+  String json = "{";
+  json += "\"batteryVoltage\":" + String(lastBatVolt, 2) + ",";
+  json += "\"solarVoltage\":" + String(lastSolVolt, 2) + ",";
+  json += "\"gridPresent\":" + String(debouncedGridState ? "true" : "false") + ",";
+  json += "\"inverterState\":" + String(inverterState ? "true" : "false") + ",";
+  json += "\"smpsState\":" + String(smpsState ? "true" : "false") + ",";
+  json += "\"modeString\":\"" + currentModeString + "\",";
+  json += "\"webModeOverride\":" + String(webModeOverride) + ",";
+  json += "\"forceChargingActive\":" + String(forceChargingActive ? "true" : "false") + ",";
+  json += "\"topup530Active\":" + String(topup530Active ? "true" : "false") + ",";
+  json += "\"topup1amActive\":" + String(topup1amActive ? "true" : "false") + ",";
+  json += "\"normalChargingActive\":" + String(normalChargingActive ? "true" : "false") + ",";
+  json += "\"flatlineDetected\":" + String(flatlineDetected ? "true" : "false") + ",";
+  json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"firmwareVersion\":\"" + String(FIRMWARE_VERSION) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetMode() {
+  if (server.hasArg("mode")) {
+    webModeOverride = server.arg("mode").toInt();
+  }
+  server.send(200, "application/json", "{\"success\":true,\"webModeOverride\":" + String(webModeOverride) + "}");
+}
+
+void handleSetCharge() {
+  if (server.hasArg("active")) {
+    String act = server.arg("active");
+    forceChargingActive = (act == "true" || act == "1");
+  } else {
+    forceChargingActive = !forceChargingActive;
+  }
+  server.send(200, "application/json", "{\"success\":true,\"forceChargingActive\":" + String(forceChargingActive ? "true" : "false") + "}");
+}
+
+void handleSetRelay() {
+  if (server.hasArg("inverter")) {
+    manualInverterOverride = (server.arg("inverter") == "true" || server.arg("inverter") == "1");
+  }
+  if (server.hasArg("smps")) {
+    manualSmpsOverride = (server.arg("smps") == "true" || server.arg("smps") == "1");
+  }
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
+void handleOTAUpdate() {
+  if (!server.hasArg("url")) {
+    server.send(400, "application/json", "{\"error\":\"Missing firmware URL parameter\"}");
+    return;
+  }
+  String firmwareUrl = server.arg("url");
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Starting OTA update from GitHub...\"}");
+  
+  WiFiClientSecure client;
+  client.setInsecure(); // Skip HTTPS cert check for GitHub raw binary download
+  
+  t_httpUpdate_return ret = httpUpdate.update(client, firmwareUrl);
+  if (ret == HTTP_UPDATE_OK) {
+    Serial.println("OTA Update Successful! Restarting ESP32...");
+  } else {
+    Serial.printf("OTA Update Failed. Error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+  }
+}
+
+// ---------------------------------------------------------
+// 🌐 GLOBAL FIREBASE CLOUD REALTIME SYNC (FREE RTOS TASK)
+// ---------------------------------------------------------
+void syncFirebaseTask(void * pvParameters) {
+  // Create HTTP and Secure Client objects once outside the loop to prevent memory fragmentation
+  HTTPClient http;
+  WiFiClientSecure client;
+  client.setInsecure(); // Required for ESP32 to bypass HTTPS certificate validation
+
+  for (;;) {
+    if (WiFi.status() == WL_CONNECTED) {
+      http.setTimeout(3000);
+
+      // 1. Fetch pending global web commands & app heartbeat from Firebase
+      String commandUrl = "https://my-smart-off-grid-default-rtdb.firebaseio.com/commands.json";
+      http.begin(client, commandUrl); // Use WiFiClientSecure
+      int httpCode = http.GET();
+      
+      if (httpCode == 200) {
+        String payload = http.getString();
+        
+        // Parse webModeOverride if present
+        int modeIdx = payload.indexOf("\"webModeOverride\":");
+        if (modeIdx != -1) {
+          int val = payload.substring(modeIdx + 18).toInt();
+          if (val >= -1 && val <= 4) webModeOverride = val;
+        }
+        
+        // Parse forceChargingActive if present
+        int chargeIdx = payload.indexOf("\"forceChargingActive\":");
+        if (chargeIdx != -1) {
+          String valStr = payload.substring(chargeIdx + 22, chargeIdx + 27);
+          forceChargingActive = (valStr.indexOf("true") != -1);
+        }
+        
+        // Parse lastHeartbeat / app active ping (Only reset timer if value CHANGED)
+        int hbIdx = payload.indexOf("\"lastHeartbeat\":");
+        if (hbIdx != -1) {
+          int commaIdx = payload.indexOf(",", hbIdx);
+          if (commaIdx == -1) commaIdx = payload.indexOf("}", hbIdx);
+          if (commaIdx != -1) {
+            String hbValue = payload.substring(hbIdx + 16, commaIdx);
+            if (hbValue != lastReceivedHeartbeatStr) {
+               lastReceivedHeartbeatStr = hbValue; // Update tracker
+               lastAppHeartbeatTime = millis();    // Reset the 3-hour timeout timer
+            }
+          }
+        }
+      }
+      http.end();
+
+      // Evaluate if App session is active (App opened within 3 hours or pinged)
+      if (lastAppHeartbeatTime == 0) lastAppHeartbeatTime = millis(); // Boot default
+      if ((millis() - lastAppHeartbeatTime) < ACTIVE_SESSION_TIMEOUT_MS) {
+        isAppSessionActive = true;
+      } else {
+        isAppSessionActive = false;
+      }
+
+      // 2. Push status telemetry to Firebase ONLY when App session is active
+      if (isAppSessionActive) {
+        String firebaseUrl = "https://my-smart-off-grid-default-rtdb.firebaseio.com/status.json";
+        http.begin(client, firebaseUrl); // Use WiFiClientSecure
+        http.addHeader("Content-Type", "application/json");
+
+        String jsonPayload = "{";
+        jsonPayload += "\"batteryVoltage\":" + String(lastBatVolt, 2) + ",";
+        jsonPayload += "\"solarVoltage\":" + String(lastSolVolt, 2) + ",";
+        jsonPayload += "\"gridPresent\":" + String(debouncedGridState ? "true" : "false") + ",";
+        jsonPayload += "\"inverterState\":" + String(inverterState ? "true" : "false") + ",";
+        jsonPayload += "\"smpsState\":" + String(smpsState ? "true" : "false") + ",";
+        jsonPayload += "\"modeString\":\"" + currentModeString + "\",";
+        jsonPayload += "\"webModeOverride\":" + String(webModeOverride) + ",";
+        jsonPayload += "\"forceChargingActive\":" + String(forceChargingActive ? "true" : "false") + ",";
+        jsonPayload += "\"topup530Active\":" + String(topup530Active ? "true" : "false") + ",";
+        jsonPayload += "\"topup1amActive\":" + String(topup1amActive ? "true" : "false") + ",";
+        jsonPayload += "\"normalChargingActive\":" + String(normalChargingActive ? "true" : "false") + ",";
+        jsonPayload += "\"flatlineDetected\":" + String(flatlineDetected ? "true" : "false") + ",";
+        jsonPayload += "\"wifiConnected\":true,";
+        jsonPayload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+        jsonPayload += "\"firmwareVersion\":\"" + String(FIRMWARE_VERSION) + "\",";
+        jsonPayload += "\"sessionActive\":true";
+        jsonPayload += "}";
+
+        http.PUT(jsonPayload);
+        http.end();
+      }
+    }
+    
+    // Wait 2.5 seconds before the next Firebase sync
+    // vTaskDelay frees up Core 0 to handle WiFi duties without blocking
+    vTaskDelay(2500 / portTICK_PERIOD_MS);
+  }
+}
+
 void loop() {
+  // Handle local web server requests
+  server.handleClient();
+
+
   String displayTime = "--:--";
-  int currentHour = 12; // Variable used to check the current hour
-  int currentMinute = 0; // Variable used to check the current minute
+  int currentHour = 12; 
+  int currentMinute = 0; 
 
   if (WiFi.status() == WL_CONNECTED) {
     timeClient.update();
     displayTime = timeClient.getFormattedTime().substring(0, 5);
-    currentHour = timeClient.getHours(); // Get current hour via Wi-Fi NTP
-    currentMinute = timeClient.getMinutes(); // Get current minute via Wi-Fi NTP
+    currentHour = timeClient.getHours(); 
+    currentMinute = timeClient.getMinutes(); 
     static unsigned long lastRtcSync = 0;
     if (millis() - lastRtcSync >= 3600000 || lastRtcSync == 0) {
       unsigned long epoch = timeClient.getEpochTime();
-      if (epoch > 1767225600) { // Only adjust if time is valid (post-2026)
+      if (epoch > 1767225600) { 
         rtc.adjust(DateTime(epoch)); 
         lastRtcSync = millis();
       }
@@ -225,8 +432,8 @@ void loop() {
     DateTime now = rtc.now();
     char buf[] = "hh:mm";
     displayTime = String(now.toString(buf));
-    currentHour = now.hour(); // Get current hour via RTC (fallback)
-    currentMinute = now.minute(); // Get current minute via RTC (fallback)
+    currentHour = now.hour(); 
+    currentMinute = now.minute(); 
   }
 
   float batVolt = getBatteryVoltage();
@@ -243,9 +450,27 @@ void loop() {
   }
   bool isGrid = debouncedGridState;
   
-  bool manualMode = (digitalRead(MANUAL_SWITCH) == LOW); 
-  bool ecoMode   = manualMode ? false : (digitalRead(ECO_SWITCH) == LOW);
-  bool pcutMode  = manualMode ? false : (digitalRead(PCUT_SWITCH) == LOW); 
+  // Physical Switches Reading
+  bool rawManual = (digitalRead(MANUAL_SWITCH) == LOW); 
+  bool rawEco   = rawManual ? false : (digitalRead(ECO_SWITCH) == LOW);
+  bool rawPcut  = rawManual ? false : (digitalRead(PCUT_SWITCH) == LOW);
+
+  // Evaluate Active Mode (Physical Switches or Web Override)
+  bool manualMode = rawManual;
+  bool ecoMode    = rawEco;
+  bool pcutMode   = rawPcut;
+
+  if (webModeOverride == 0) { // POWER OFF
+    manualMode = false; ecoMode = false; pcutMode = false;
+  } else if (webModeOverride == 1) { // ECO MODE
+    manualMode = false; ecoMode = true; pcutMode = false;
+  } else if (webModeOverride == 2) { // POWER CUT
+    manualMode = false; ecoMode = false; pcutMode = true;
+  } else if (webModeOverride == 3) { // ECO+POWER CUT
+    manualMode = false; ecoMode = true; pcutMode = true;
+  } else if (webModeOverride == 4) { // MANUAL OVERRIDE
+    manualMode = true; ecoMode = false; pcutMode = false;
+  }
   
   String modeString = "POWER OFF"; 
   String errorString = ""; 
@@ -264,7 +489,6 @@ void loop() {
   // ---------------------------------------------------------
   bool shouldRunGridReturnTimer = false;
   if (isGrid && inverterState) {
-    // In battery backup mode, always run grid return timer to switch back to grid power
     if (pcutMode || ecoMode) {
       shouldRunGridReturnTimer = true; 
     }
@@ -319,28 +543,22 @@ void loop() {
   }
   else if (manualMode) {
     modeString = "MANUAL";
-    inverterState = false;
-    smpsState = false;
+    inverterState = manualInverterOverride;
+    smpsState = manualSmpsOverride;
   }
   else if (ecoMode && pcutMode) {
     modeString = "ECO+POWER CUT"; 
     
     if (!isGrid) {
       if (inverterState) {
-        // Inverter was already ON when grid failed → skip countdown, stay ON
         if (batVolt <= 12.0) inverterState = false;
       } else {
-        // Inverter was OFF when grid failed → wait for countdown
         if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt >= 12.5) {
           inverterState = true;
         }
         if (batVolt <= 12.0) inverterState = false;
       }
     } else {
-      // Solar logic commented out: In battery backup mode, inverter remains OFF when grid is present
-      /*
-      if (solVolt > 14.0 && batVolt >= 15.3) inverterState = true;
-      */
       if (gridReturnTimerActive && (millis() - gridReturnTime >= TIMER_DELAY_MS)) {
         inverterState = false;
       }
@@ -348,11 +566,6 @@ void loop() {
   } 
   else if (ecoMode) {
     modeString = "ECO MODE";
-    // Solar logic commented out: In battery backup mode, inverter remains OFF when grid is present
-    /*
-    if (solVolt > 14.0 && batVolt >= 15.3) inverterState = true;
-    if (batVolt <= 14.2) inverterState = false;
-    */
     inverterState = false;
   } 
   else if (pcutMode) {
@@ -376,7 +589,7 @@ void loop() {
   // ---------------------------------------------------------
   // ⚡ SMPS EXTRA CHARGER LOGIC (WITH PREVENT LOOPING & GRID DEBOUNCE)
   // ---------------------------------------------------------
-  bool allowCharging = (errorString == "") && isGrid && !inverterState && !manualMode && (ecoMode || pcutMode || modeString == "POWER OFF");
+  bool allowCharging = (errorString == "") /* && isGrid */ && !inverterState && !manualMode && (ecoMode || pcutMode || modeString == "POWER OFF");
 
   // Reset top-up Done flags when we are outside the respective time windows
   if (currentHour != 17) {
@@ -386,16 +599,22 @@ void loop() {
     topup1amDone = false;
   }
 
-  if (allowCharging) {
+  // Auto safety cutoff for force charging if battery reaches stop threshold
+  if (forceChargingActive && batVolt >= BAT_CHARGE_STOP_THRESHOLD) {
+    forceChargingActive = false;
+  }
+
+  if (forceChargingActive) {
+    smpsState = true;
+  }
+  else if (allowCharging) {
     
     // 1. Mandatory 5:30 PM top-up charge (Evening Prep Logic)
-    // Triggers at 17:30 to 17:59 if battery is under target and not done today
     if ((currentHour == 17 && currentMinute >= 30) && batVolt < BAT_TOPUP_START_THRESHOLD && !topup530Done && !topup1amActive && !normalChargingActive) {
       topup530Active = true;
     }
     
     // 2. Mandatory 1:00 AM battery top-up charge (Night Emergency Backup)
-    // Triggers at 1:00 to 1:59 if battery is under target and not done today
     if (currentHour == 1 && batVolt < BAT_TOPUP_START_THRESHOLD && !topup1amDone && !topup530Active && !normalChargingActive) {
       topup1amActive = true;
     }
@@ -414,9 +633,8 @@ void loop() {
           flatlineDetected = false;
         } else {
           if (millis() - lastVoltageCheckTime >= VOLTAGE_CHECK_INTERVAL) {
-            // Check if voltage is not higher than the previous value
             if (batVolt <= lastRecordedVoltage) {
-              flatlineDetected = true; // Not increased, SMPS cut off
+              flatlineDetected = true; 
             }
             lastRecordedVoltage = batVolt;
             lastVoltageCheckTime = millis();
@@ -436,7 +654,7 @@ void loop() {
       smpsState = true;
       if (batVolt >= BAT_CHARGE_STOP_THRESHOLD || flatlineDetected) {
         topup530Active = false;
-        topup530Done = true; // Mark as done to prevent looping within the hour
+        topup530Done = true; 
         smpsState = false;
       }
     }
@@ -444,7 +662,7 @@ void loop() {
       smpsState = true;
       if (batVolt >= BAT_CHARGE_STOP_THRESHOLD || flatlineDetected) {
         topup1amActive = false;
-        topup1amDone = true; // Mark as done to prevent looping within the hour
+        topup1amDone = true; 
         smpsState = false;
       }
     }
@@ -473,7 +691,9 @@ void loop() {
 
   // Override display modeString if charging
   if (smpsState) {
-    if (topup530Active) {
+    if (forceChargingActive) {
+      modeString = "FORCE CHG";
+    } else if (topup530Active) {
       modeString = "5:30 TOPUP";
     } else if (topup1amActive) {
       modeString = "1AM TOPUP";
@@ -481,6 +701,8 @@ void loop() {
       modeString = "SMPS CHG";
     }
   }
+
+  currentModeString = modeString;
 
   // ---------------------------------------------------------
   // OLED DISPLAY GRAPHICS LAYOUT
