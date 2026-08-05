@@ -1,52 +1,57 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  Zap, 
-  Sun, 
-  Battery, 
-  Wifi, 
-  Power, 
-  Clock, 
-  Sliders, 
-  ShieldAlert, 
-  Activity, 
-  RefreshCw, 
-  CheckCircle2, 
+import {
+  Zap,
+  Sun,
+  Battery,
+  Wifi,
+  WifiOff,
+  Power,
+  Clock,
+  Sliders,
+  ShieldAlert,
+  Activity,
+  RefreshCw,
   Radio,
   FileText,
   SlidersHorizontal,
-  Info
+  ChevronRight,
+  CloudLightning,
+  Gauge,
+  PlugZap,
+  BatteryCharging,
+  Signal,
+  Timer,
+  AlertTriangle,
+  ToggleLeft,
+  ToggleRight
 } from 'lucide-react';
-import { 
-  fetchSystemStatus, 
-  setSystemMode, 
-  toggleForceCharging, 
-  controlManualRelay 
+import {
+  fetchSystemStatus,
+  setSystemMode,
+  toggleForceCharging,
+  controlManualRelay
 } from './services/esp32Api';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('overview'); // overview, controls, timers, settings, logs
+  const [activeTab, setActiveTab] = useState('overview');
   const [esp32Ip, setEsp32Ip] = useState('192.168.1.150');
-  const [connectionMode, setConnectionMode] = useState('cloud'); // 'cloud', 'local', 'mock'
+  const [connectionMode, setConnectionMode] = useState('cloud');
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState([]);
   const [logs, setLogs] = useState([]);
 
-  // Log append helper
   const addLog = (msg, type = 'info') => {
     const time = new Date().toLocaleTimeString();
     setLogs(prev => [{ id: Date.now() + Math.random(), time, msg, type }, ...prev.slice(0, 49)]);
   };
 
-  // Initial log
   useEffect(() => {
-    addLog('System web interface initialized in Global Cloud Access Mode.', 'info');
+    addLog('System initialized — Global Cloud Access Mode active.', 'info');
   }, []);
 
-  // Periodic status polling (every 2 seconds)
   useEffect(() => {
     let isMounted = true;
-    
     async function updateStatus() {
       const data = await fetchSystemStatus(esp32Ip, connectionMode);
       if (isMounted && data) {
@@ -57,388 +62,391 @@ export default function App() {
         });
       }
     }
-
     updateStatus();
     const interval = setInterval(updateStatus, 2000);
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-    };
+    return () => { isMounted = false; clearInterval(interval); };
   }, [esp32Ip, connectionMode]);
 
   const handleModeChange = async (modeVal) => {
     setLoading(true);
-    const modeNames = { '-1': 'AUTO (Switches)', '0': 'POWER OFF', '1': 'ECO MODE', '2': 'POWER CUT', '3': 'ECO+POWER CUT', '4': 'MANUAL' };
-    addLog(`Requested Mode Change: ${modeNames[modeVal] || modeVal}`, 'action');
+    const modeNames = { '-1': 'AUTO', '0': 'POWER OFF', '1': 'ECO', '2': 'POWER CUT', '3': 'ECO+PCUT', '4': 'MANUAL' };
+    addLog(`Mode → ${modeNames[modeVal] || modeVal}`, 'action');
     const res = await setSystemMode(esp32Ip, connectionMode, modeVal);
-    if (res && res.success) {
+    if (res?.success) {
       setStatus(prev => prev ? { ...prev, webModeOverride: modeVal } : prev);
-      addLog(`Mode updated successfully to ${modeNames[modeVal]}`, 'success');
+      addLog(`Mode set: ${modeNames[modeVal]}`, 'success');
     }
     setLoading(false);
   };
 
   const handleForceChargeToggle = async () => {
     setLoading(true);
-    const currentActive = status ? status.forceChargingActive : false;
-    const nextState = !currentActive;
-    addLog(`Force Charge toggled: ${nextState ? 'ON' : 'OFF'}`, 'action');
+    const nextState = !(status?.forceChargingActive);
+    addLog(`Force Charge → ${nextState ? 'ON' : 'OFF'}`, 'action');
     const res = await toggleForceCharging(esp32Ip, connectionMode, nextState);
-    if (res && res.success) {
+    if (res?.success) {
       setStatus(prev => prev ? { ...prev, forceChargingActive: nextState, smpsState: nextState } : prev);
-      addLog(`SMPS Charger ${nextState ? 'FORCE ACTIVATED' : 'DEACTIVATED'}`, nextState ? 'warning' : 'info');
+      addLog(`SMPS ${nextState ? 'FORCE ON' : 'OFF'}`, nextState ? 'warning' : 'info');
     }
     setLoading(false);
   };
 
   const handleRelayToggle = async (relayType, currentState) => {
     setLoading(true);
-    addLog(`Manual Relay Command: ${relayType} -> ${!currentState ? 'ON' : 'OFF'}`, 'action');
+    addLog(`Relay: ${relayType} → ${!currentState ? 'ON' : 'OFF'}`, 'action');
     await controlManualRelay(esp32Ip, connectionMode, relayType, !currentState);
     setLoading(false);
   };
 
-  // Calculate SoC (State of Charge %)
   const calculateSoc = (volt) => {
     if (!volt) return 0;
-    const soc = Math.min(100, Math.max(0, Math.round(((volt - 11.5) / (14.8 - 11.5)) * 100)));
-    return soc;
+    return Math.min(100, Math.max(0, Math.round(((volt - 11.5) / (14.8 - 11.5)) * 100)));
   };
 
   const batVolt = status ? status.batteryVoltage : 13.4;
   const soc = calculateSoc(batVolt);
 
-  // SVG Gauge Calculations
-  const radius = 80;
+  // SVG Gauge
+  const radius = 78;
   const circumference = 2 * Math.PI * radius;
-  const strokeDashoffset = circumference - (soc / 100) * (circumference * 0.75); // 270 deg arc
+  const strokeDashoffset = circumference - (soc / 100) * (circumference * 0.75);
+
+  const getSocColor = () => {
+    if (status?.smpsState) return 'var(--accent-cyan)';
+    if (soc > 60) return 'var(--accent-green)';
+    if (soc > 30) return 'var(--accent-yellow)';
+    return 'var(--accent-red)';
+  };
+
+  const tabs = [
+    { id: 'overview', label: 'Overview', icon: <Activity size={16} /> },
+    { id: 'controls', label: 'Controls', icon: <Sliders size={16} /> },
+    { id: 'timers', label: 'Timers', icon: <Clock size={16} /> },
+    { id: 'settings', label: 'Thresholds', icon: <SlidersHorizontal size={16} /> },
+    { id: 'logs', label: 'Logs', icon: <FileText size={16} /> },
+  ];
 
   return (
     <div className="app-container">
-      {/* Top Application Header */}
-      <header className="app-header glass-card">
-        <div className="brand-title">
-          <div className="brand-icon">
-            <Zap size={28} />
+      {/* =================== HEADER =================== */}
+      <header className="app-header">
+        <div className="header-top-row">
+          <div className="brand-title">
+            <div className="brand-icon">
+              <Zap size={22} />
+            </div>
+            <div className="brand-text">
+              <h1>Smart Solar Off-Grid</h1>
+              <p>ESP32 Power Management Console</p>
+            </div>
           </div>
-          <div className="brand-text">
-            <h1>Smart Solar Off-Grid Controller</h1>
-            <p>Production Web Management Console • ESP32 Smart Systems</p>
+
+          <div className="connection-bar">
+            {status?.wifiConnected ?
+              <Wifi size={16} className="text-green" /> :
+              <WifiOff size={16} className="text-red" />
+            }
+            {connectionMode === 'local' && (
+              <input
+                type="text"
+                className="ip-input"
+                value={esp32Ip}
+                onChange={(e) => setEsp32Ip(e.target.value)}
+                placeholder="192.168.1.150"
+              />
+            )}
+            <button
+              className={`badge ${connectionMode === 'cloud' ? 'badge-info' : connectionMode === 'local' ? 'badge-warning' : 'badge-danger'}`}
+              onClick={() => {
+                const nextMode = connectionMode === 'cloud' ? 'local' : connectionMode === 'local' ? 'mock' : 'cloud';
+                setConnectionMode(nextMode);
+                addLog(`Mode: ${nextMode.toUpperCase()}`, 'info');
+              }}
+            >
+              {connectionMode === 'cloud' ? '🌐 Cloud' : connectionMode === 'local' ? '🏠 Local' : '🧪 Mock'}
+            </button>
           </div>
         </div>
 
-        {/* Navigation Tabs */}
         <nav className="nav-tabs">
-          <button 
-            className={`nav-tab-btn ${activeTab === 'overview' ? 'active' : ''}`}
-            onClick={() => setActiveTab('overview')}
-          >
-            <Activity size={18} /> Overview
-          </button>
-          <button 
-            className={`nav-tab-btn ${activeTab === 'controls' ? 'active' : ''}`}
-            onClick={() => setActiveTab('controls')}
-          >
-            <Sliders size={18} /> Controls & Modes
-          </button>
-          <button 
-            className={`nav-tab-btn ${activeTab === 'timers' ? 'active' : ''}`}
-            onClick={() => setActiveTab('timers')}
-          >
-            <Clock size={18} /> Timers & Logic
-          </button>
-          <button 
-            className={`nav-tab-btn ${activeTab === 'settings' ? 'active' : ''}`}
-            onClick={() => setActiveTab('settings')}
-          >
-            <SlidersHorizontal size={18} /> Thresholds
-          </button>
-          <button 
-            className={`nav-tab-btn ${activeTab === 'logs' ? 'active' : ''}`}
-            onClick={() => setActiveTab('logs')}
-          >
-            <FileText size={18} /> Event Logs
-          </button>
+          {tabs.map(tab => (
+            <button
+              key={tab.id}
+              className={`nav-tab-btn ${activeTab === tab.id ? 'active' : ''}`}
+              onClick={() => setActiveTab(tab.id)}
+            >
+              {tab.icon} {tab.label}
+            </button>
+          ))}
         </nav>
-
-        {/* Connection Bar */}
-        <div className="connection-bar">
-          <Wifi size={18} className={status?.wifiConnected ? 'text-green' : 'text-muted'} />
-          {connectionMode === 'local' && (
-            <input 
-              type="text" 
-              className="ip-input" 
-              value={esp32Ip}
-              onChange={(e) => setEsp32Ip(e.target.value)}
-              placeholder="192.168.1.150"
-            />
-          )}
-          <button 
-            className={`badge ${connectionMode === 'cloud' ? 'badge-success' : connectionMode === 'local' ? 'badge-warning' : 'badge-danger'}`}
-            onClick={() => {
-              const nextMode = connectionMode === 'cloud' ? 'local' : connectionMode === 'local' ? 'mock' : 'cloud';
-              setConnectionMode(nextMode);
-              addLog(`Switched mode to: ${nextMode.toUpperCase()} Access`, 'info');
-            }}
-          >
-            {connectionMode === 'cloud' ? '🌐 Global Cloud Sync' : connectionMode === 'local' ? '🏠 Local Wi-Fi IP' : '🧪 Live Mock Mode'}
-          </button>
-        </div>
       </header>
 
-      {/* TAB 1: OVERVIEW & TELEMETRY */}
+      {/* =================== TAB: OVERVIEW =================== */}
       {activeTab === 'overview' && (
-        <>
-          <div className="telemetry-grid">
-            {/* Circular Gauge Hero Battery Card */}
-            <div className="glass-card hero-battery-card">
-              <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
-                  <Battery size={20} color="var(--accent-cyan)" />
-                  <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)', fontWeight: '600' }}>
-                    Battery Bank Telemetry
-                  </span>
-                </div>
-                <div className="metric-value-large">
-                  {batVolt.toFixed(1)} <span className="metric-unit">V</span>
-                </div>
-                <p style={{ color: 'var(--text-muted)', marginTop: '0.5rem', fontSize: '0.9rem' }}>
-                  Calculated SoC: <strong style={{ color: '#fff' }}>{soc}%</strong>
-                </p>
-                <div style={{ marginTop: '1rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-                  {status?.smpsState && (
-                    <span className="badge badge-success">
-                      <RefreshCw size={12} className="spin" /> -0.5V Surface Charge Offset
-                    </span>
-                  )}
-                  <span className={`badge ${status?.smpsState ? 'badge-success' : 'badge-warning'}`}>
-                    {status?.smpsState ? '⚡ SMPS CHARGING ACTIVE' : 'DISCHARGING / STANDBY'}
-                  </span>
-                </div>
+        <div className="animate-in" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          {/* Status Strip */}
+          <div className="status-strip">
+            <div className="status-chip">
+              <div className={`status-chip-icon ${status?.gridPresent ? 'green' : 'red'}`}>
+                <PlugZap size={18} />
               </div>
-
-              {/* Circular SVG Gauge */}
-              <div className="svg-gauge-container">
-                <svg width="220" height="220" viewBox="0 0 200 200">
-                  <circle 
-                    cx="100" cy="100" r={radius} 
-                    fill="none" 
-                    stroke="rgba(255,255,255,0.06)" 
-                    strokeWidth="14" 
-                    strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`} 
-                    transform="rotate(135 100 100)"
-                  />
-                  <circle 
-                    cx="100" cy="100" r={radius} 
-                    fill="none" 
-                    stroke={status?.smpsState ? 'url(#cyanGrad)' : soc > 30 ? 'url(#greenGrad)' : 'url(#redGrad)'} 
-                    strokeWidth="14" 
-                    strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`} 
-                    strokeDashoffset={strokeDashoffset} 
-                    strokeLinecap="round" 
-                    transform="rotate(135 100 100)"
-                    style={{ transition: 'stroke-dashoffset 0.8s ease' }}
-                  />
-                  <defs>
-                    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                      <stop offset="0%" stopColor="#00f2fe" />
-                      <stop offset="100%" stopColor="#3b82f6" />
-                    </linearGradient>
-                    <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                      <stop offset="0%" stopColor="#10b981" />
-                      <stop offset="100%" stopColor="#34d399" />
-                    </linearGradient>
-                    <linearGradient id="redGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                      <stop offset="0%" stopColor="#ef4444" />
-                      <stop offset="100%" stopColor="#f97316" />
-                    </linearGradient>
-                  </defs>
-                </svg>
-                <div className="svg-gauge-text">
-                  <div className="svg-gauge-val" style={{ color: status?.smpsState ? 'var(--accent-cyan)' : '#fff' }}>
-                    {soc}%
-                  </div>
-                  <div className="svg-gauge-sub">{batVolt.toFixed(1)}V DC</div>
-                </div>
+              <div className="status-chip-text">
+                <span className="status-chip-label">Grid</span>
+                <span className="status-chip-value" style={{ color: status?.gridPresent ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+                  {status?.gridPresent ? 'ONLINE' : 'DOWN'}
+                </span>
               </div>
             </div>
 
-            {/* Grid Power Status Card */}
-            <div className="glass-card">
-              <div className="card-label">
-                <span>Main Grid Line</span>
-                <Radio size={18} color={status?.gridPresent ? 'var(--accent-green)' : 'var(--accent-red)'} />
+            <div className="status-chip">
+              <div className={`status-chip-icon ${status?.inverterState ? 'cyan' : 'purple'}`}>
+                <Power size={18} />
               </div>
-              <div className="metric-value-large" style={{ color: status?.gridPresent ? 'var(--accent-green)' : 'var(--accent-red)' }}>
-                {status?.gridPresent ? 'GRID ONLINE' : 'POWER CUT'}
+              <div className="status-chip-text">
+                <span className="status-chip-label">Inverter</span>
+                <span className="status-chip-value">
+                  {status?.inverterState ? 'ON' : 'OFF'}
+                </span>
               </div>
-              <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginTop: '0.75rem' }}>
-                1,000ms Debounce Filter: Healthy
-              </p>
             </div>
 
-            {/* Solar PV Input Card */}
-            <div className="glass-card">
-              <div className="card-label">
-                <span>Solar PV Array</span>
-                <Sun size={18} color="var(--accent-yellow)" />
+            <div className="status-chip">
+              <div className={`status-chip-icon ${status?.smpsState ? 'cyan' : 'yellow'}`}>
+                <BatteryCharging size={18} />
               </div>
-              <div className="metric-value-large">
-                0.0 <span className="metric-unit">V</span>
+              <div className="status-chip-text">
+                <span className="status-chip-label">SMPS</span>
+                <span className="status-chip-value" style={{ color: status?.smpsState ? 'var(--accent-cyan)' : 'var(--text-secondary)' }}>
+                  {status?.smpsState ? 'CHARGING' : 'STANDBY'}
+                </span>
               </div>
-              <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginTop: '0.75rem' }}>
-                PV Sensor Disconnected (Night / Off-Grid Mode)
-              </p>
+            </div>
+
+            <div className="status-chip">
+              <div className="status-chip-icon cyan">
+                <Signal size={18} />
+              </div>
+              <div className="status-chip-text">
+                <span className="status-chip-label">Wi-Fi</span>
+                <span className="status-chip-value">
+                  {status?.rssi ? `${status.rssi} dBm` : '—'}
+                </span>
+              </div>
             </div>
           </div>
 
-          {/* Quick Actions & Live Telemetry Stream */}
-          <div className="controls-section" style={{ marginTop: '1.25rem' }}>
-            <div className="glass-card">
-              <h2 className="section-title">
-                <Sliders size={20} color="var(--accent-cyan)" /> Active System Mode
-              </h2>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem' }}>
-                <div>
-                  <div style={{ fontSize: '1.75rem', fontWeight: '800', color: 'var(--accent-cyan)', fontFamily: 'var(--font-mono)' }}>
-                    {status?.modeString || 'POWER OFF'}
-                  </div>
-                  <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-                    Override: {status?.webModeOverride === -1 ? 'AUTO (Hardware Switches)' : 'Software Web Override Active'}
-                  </p>
+          {/* Battery Hero Gauge */}
+          <div className="battery-hero glass-card">
+            <div className="battery-info">
+              <div className="battery-info-header">
+                <Battery size={18} color="var(--accent-cyan)" />
+                <span>Battery Bank</span>
+              </div>
+              <div className="battery-voltage">
+                {batVolt.toFixed(1)}<span className="unit">V</span>
+              </div>
+              <p className="battery-soc-text">
+                State of Charge: <strong>{soc}%</strong>
+              </p>
+              <div className="battery-badges">
+                {status?.smpsState && (
+                  <span className="badge badge-info">
+                    <RefreshCw size={11} className="spin" /> Charging
+                  </span>
+                )}
+                <span className={`badge ${status?.smpsState ? 'badge-info' : soc > 30 ? 'badge-success' : 'badge-danger'}`}>
+                  {status?.smpsState ? '⚡ SMPS Active' : soc > 30 ? '✓ Healthy' : '⚠ Low'}
+                </span>
+                {status?.forceChargingActive && (
+                  <span className="badge badge-warning">Force Charge</span>
+                )}
+              </div>
+            </div>
+
+            <div className="svg-gauge-wrapper">
+              <svg width="200" height="200" viewBox="0 0 200 200">
+                <circle
+                  cx="100" cy="100" r={radius}
+                  fill="none"
+                  stroke="rgba(255,255,255,0.04)"
+                  strokeWidth="12"
+                  strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
+                  transform="rotate(135 100 100)"
+                />
+                <circle
+                  cx="100" cy="100" r={radius}
+                  fill="none"
+                  stroke={status?.smpsState ? 'url(#cyanGrad)' : soc > 60 ? 'url(#greenGrad)' : soc > 30 ? 'url(#yellowGrad)' : 'url(#redGrad)'}
+                  strokeWidth="12"
+                  strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
+                  strokeDashoffset={strokeDashoffset}
+                  strokeLinecap="round"
+                  transform="rotate(135 100 100)"
+                  style={{ transition: 'stroke-dashoffset 1s cubic-bezier(0.4, 0, 0.2, 1)' }}
+                />
+                <defs>
+                  <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stopColor="#38bdf8" />
+                    <stop offset="100%" stopColor="#6366f1" />
+                  </linearGradient>
+                  <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stopColor="#22c55e" />
+                    <stop offset="100%" stopColor="#10b981" />
+                  </linearGradient>
+                  <linearGradient id="yellowGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stopColor="#eab308" />
+                    <stop offset="100%" stopColor="#f59e0b" />
+                  </linearGradient>
+                  <linearGradient id="redGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stopColor="#ef4444" />
+                    <stop offset="100%" stopColor="#f97316" />
+                  </linearGradient>
+                </defs>
+              </svg>
+              <div className="svg-gauge-text">
+                <div className="svg-gauge-val" style={{ color: getSocColor() }}>
+                  {soc}%
                 </div>
-                <button 
-                  className="nav-tab-btn active"
-                  onClick={() => setActiveTab('controls')}
-                >
-                  Change Mode in Control Center &rarr;
+                <div className="svg-gauge-sub">{batVolt.toFixed(1)}V DC</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Overview Cards */}
+          <div className="overview-cards-grid">
+            {/* Active Mode */}
+            <div className="glass-card info-card">
+              <div className="card-header">
+                <span className="card-label">Active Mode</span>
+                <div className="pulse-dot cyan"></div>
+              </div>
+              <div className="active-mode-card">
+                <div>
+                  <div className="active-mode-value">{status?.modeString || 'POWER OFF'}</div>
+                  <div className="active-mode-sub">
+                    {status?.webModeOverride === -1 ? 'Auto (Hardware)' : 'Web Override'}
+                  </div>
+                </div>
+                <button className="btn-go-controls" onClick={() => setActiveTab('controls')}>
+                  Change <ChevronRight size={14} />
                 </button>
               </div>
             </div>
 
-            {/* Force Charge Quick Status */}
-            <div className="glass-card force-charge-card">
-              <div>
-                <h2 className="section-title">
-                  <Zap size={20} color="var(--accent-yellow)" /> Force Charge Action
-                </h2>
-                <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-                  Instantly activate SMPS charger manually.
-                </p>
+            {/* Force Charge Quick */}
+            <div className="glass-card info-card">
+              <div className="card-header">
+                <span className="card-label">Quick Charge</span>
+                <Zap size={16} color="var(--accent-yellow)" />
               </div>
-              <button 
-                className={`btn-force-charge ${status?.forceChargingActive ? 'btn-force-charge-on' : 'btn-force-charge-off'}`}
-                onClick={handleForceChargeToggle}
-                disabled={loading}
-              >
-                <Zap size={20} />
-                {status?.forceChargingActive ? 'STOP FORCE CHARGE' : 'FORCE CHARGE ON'}
-              </button>
+              <div className="force-charge-section">
+                <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                  Instantly activate SMPS charger.
+                </p>
+                <button
+                  className={`btn-force-charge ${status?.forceChargingActive ? 'btn-force-charge-on' : 'btn-force-charge-off'}`}
+                  onClick={handleForceChargeToggle}
+                  disabled={loading}
+                >
+                  <Zap size={16} />
+                  {status?.forceChargingActive ? 'STOP' : 'CHARGE'}
+                </button>
+              </div>
+            </div>
+
+            {/* Grid Status */}
+            <div className="glass-card info-card">
+              <div className="card-header">
+                <span className="card-label">Main Grid</span>
+                <Radio size={16} color={status?.gridPresent ? 'var(--accent-green)' : 'var(--accent-red)'} />
+              </div>
+              <div className="card-value" style={{ color: status?.gridPresent ? 'var(--accent-green)' : 'var(--accent-red)' }}>
+                {status?.gridPresent ? 'ONLINE' : 'POWER CUT'}
+              </div>
+              <div className="card-subtitle">Debounce: 1,000ms filter active</div>
+            </div>
+
+            {/* Solar PV */}
+            <div className="glass-card info-card">
+              <div className="card-header">
+                <span className="card-label">Solar PV</span>
+                <Sun size={16} color="var(--accent-yellow)" />
+              </div>
+              <div className="card-value">0.0<span style={{ fontSize: '0.9rem', color: 'var(--text-muted)', fontWeight: 500 }}> V</span></div>
+              <div className="card-subtitle">PV Sensor disconnected</div>
             </div>
           </div>
-        </>
+        </div>
       )}
 
-      {/* TAB 2: CONTROL CENTER */}
+      {/* =================== TAB: CONTROLS =================== */}
       {activeTab === 'controls' && (
-        <div className="controls-section">
-          {/* Mode Selector Card */}
+        <div className="controls-layout animate-in">
           <div className="glass-card">
             <h2 className="section-title">
-              <Sliders size={20} color="var(--accent-cyan)" /> System Automation Modes
+              <Sliders size={18} color="var(--accent-cyan)" /> System Modes
             </h2>
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginBottom: '1.25rem' }}>
-              Select system operating profile. Auto mode delegates control to physical switches on the ESP32 enclosure.
+            <p className="section-desc">
+              Select operating profile. Auto mode uses physical switches on the ESP32 enclosure.
             </p>
 
             <div className="mode-buttons-grid">
-              <button 
-                className={`mode-card-btn ${status?.webModeOverride === -1 ? 'active' : ''}`}
-                onClick={() => handleModeChange(-1)}
-                disabled={loading}
-              >
-                <RefreshCw size={22} />
-                <span>AUTO (Physical Switches)</span>
-              </button>
-              <button 
-                className={`mode-card-btn ${status?.webModeOverride === 1 ? 'active' : ''}`}
-                onClick={() => handleModeChange(1)}
-                disabled={loading}
-              >
-                <Zap size={22} color="var(--accent-cyan)" />
-                <span>ECO MODE</span>
-              </button>
-              <button 
-                className={`mode-card-btn ${status?.webModeOverride === 2 ? 'active' : ''}`}
-                onClick={() => handleModeChange(2)}
-                disabled={loading}
-              >
-                <ShieldAlert size={22} color="var(--accent-yellow)" />
-                <span>POWER CUT</span>
-              </button>
-              <button 
-                className={`mode-card-btn ${status?.webModeOverride === 3 ? 'active' : ''}`}
-                onClick={() => handleModeChange(3)}
-                disabled={loading}
-              >
-                <Activity size={22} color="var(--accent-blue)" />
-                <span>ECO + POWER CUT</span>
-              </button>
-              <button 
-                className={`mode-card-btn ${status?.webModeOverride === 4 ? 'active' : ''}`}
-                onClick={() => handleModeChange(4)}
-                disabled={loading}
-              >
-                <Power size={22} color="var(--accent-purple)" />
-                <span>MANUAL OVERRIDE</span>
-              </button>
-              <button 
-                className={`mode-card-btn ${status?.webModeOverride === 0 ? 'active' : ''}`}
-                onClick={() => handleModeChange(0)}
-                disabled={loading}
-              >
-                <Power size={22} color="var(--accent-red)" />
-                <span>POWER OFF</span>
-              </button>
+              {[
+                { val: -1, label: 'AUTO', sub: 'Physical Switches', icon: <RefreshCw size={20} /> },
+                { val: 1, label: 'ECO', sub: 'Battery Priority', icon: <Zap size={20} color="var(--accent-cyan)" /> },
+                { val: 2, label: 'POWER CUT', sub: 'UPS Backup', icon: <ShieldAlert size={20} color="var(--accent-yellow)" /> },
+                { val: 3, label: 'ECO + PCUT', sub: 'Hybrid Mode', icon: <Activity size={20} color="var(--accent-blue)" /> },
+                { val: 4, label: 'MANUAL', sub: 'Full Override', icon: <Power size={20} color="var(--accent-purple)" /> },
+                { val: 0, label: 'POWER OFF', sub: 'System Shutdown', icon: <Power size={20} color="var(--accent-red)" /> },
+              ].map(mode => (
+                <button
+                  key={mode.val}
+                  className={`mode-card-btn ${status?.webModeOverride === mode.val ? 'active' : ''}`}
+                  onClick={() => handleModeChange(mode.val)}
+                  disabled={loading}
+                >
+                  {mode.icon}
+                  <span>{mode.label}</span>
+                  <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 400 }}>{mode.sub}</span>
+                </button>
+              ))}
             </div>
           </div>
 
-          {/* Force Charger & Manual Relay Controls */}
-          <div className="glass-card force-charge-card">
-            <div>
-              <h2 className="section-title">
-                <Zap size={22} color="var(--accent-yellow)" /> Manual Overrides
-              </h2>
-              <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginBottom: '1.25rem' }}>
-                Force SMPS Charger ON or manually toggle relays when in MANUAL mode.
-              </p>
-            </div>
+          {/* Manual Overrides */}
+          <div className="glass-card">
+            <h2 className="section-title">
+              <Zap size={18} color="var(--accent-yellow)" /> Manual Overrides
+            </h2>
+            <p className="section-desc">
+              Force SMPS charger or toggle relays in MANUAL mode.
+            </p>
 
-            <button 
+            <button
               className={`btn-force-charge ${status?.forceChargingActive ? 'btn-force-charge-on' : 'btn-force-charge-off'}`}
               onClick={handleForceChargeToggle}
               disabled={loading}
-              style={{ marginBottom: '1rem' }}
+              style={{ width: '100%', justifyContent: 'center' }}
             >
-              <Zap size={22} />
+              <Zap size={18} />
               {status?.forceChargingActive ? 'STOP FORCE CHARGE' : 'FORCE CHARGE ON'}
             </button>
 
             {status?.webModeOverride === 4 && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                <button 
-                  className="nav-tab-btn" 
-                  style={{ width: '100%', justifyContent: 'center' }}
+              <div className="manual-relay-btns">
+                <button
+                  className="relay-toggle-btn"
                   onClick={() => handleRelayToggle('inverter', status?.inverterState)}
                 >
-                  Toggle Inverter Relay ({status?.inverterState ? 'ON' : 'OFF'})
+                  {status?.inverterState ? <ToggleRight size={18} className="text-green" /> : <ToggleLeft size={18} />}
+                  Inverter Relay ({status?.inverterState ? 'ON' : 'OFF'})
                 </button>
-                <button 
-                  className="nav-tab-btn" 
-                  style={{ width: '100%', justifyContent: 'center' }}
+                <button
+                  className="relay-toggle-btn"
                   onClick={() => handleRelayToggle('smps', status?.smpsState)}
                 >
-                  Toggle SMPS Relay ({status?.smpsState ? 'ON' : 'OFF'})
+                  {status?.smpsState ? <ToggleRight size={18} className="text-cyan" /> : <ToggleLeft size={18} />}
+                  SMPS Relay ({status?.smpsState ? 'ON' : 'OFF'})
                 </button>
               </div>
             )}
@@ -446,106 +454,104 @@ export default function App() {
         </div>
       )}
 
-      {/* TAB 3: TIMERS & AUTOMATION */}
+      {/* =================== TAB: TIMERS =================== */}
       {activeTab === 'timers' && (
-        <div className="timers-grid">
-          {/* Scheduled Top-Up Charging */}
+        <div className="timers-grid animate-in">
           <div className="glass-card">
             <h2 className="section-title">
-              <Clock size={20} color="var(--accent-cyan)" /> Scheduled Top-Up Charging
+              <Clock size={18} color="var(--accent-cyan)" /> Scheduled Charging
             </h2>
             <div className="info-item">
-              <span className="label">5:30 PM Evening Top-Up</span>
-              <span className="value">
-                {status?.topup530Active ? '⚡ ACTIVE NOW' : 'Scheduled at 17:30 (<14.5V)'}
+              <span className="label">5:30 PM Top-Up</span>
+              <span className="value" style={{ color: status?.topup530Active ? 'var(--accent-cyan)' : 'var(--text-muted)' }}>
+                {status?.topup530Active ? '⚡ ACTIVE' : 'Standby'}
               </span>
             </div>
             <div className="info-item">
-              <span className="label">1:00 AM Night Top-Up</span>
-              <span className="value">
-                {status?.topup1amActive ? '⚡ ACTIVE NOW' : 'Scheduled at 01:00 (<14.5V)'}
+              <span className="label">1:00 AM Top-Up</span>
+              <span className="value" style={{ color: status?.topup1amActive ? 'var(--accent-cyan)' : 'var(--text-muted)' }}>
+                {status?.topup1amActive ? '⚡ ACTIVE' : 'Standby'}
+              </span>
+            </div>
+            <div className="info-item">
+              <span className="label">Normal Charge</span>
+              <span className="value" style={{ color: status?.normalChargingActive ? 'var(--accent-green)' : 'var(--text-muted)' }}>
+                {status?.normalChargingActive ? '⚡ ACTIVE' : 'Idle'}
               </span>
             </div>
           </div>
 
-          {/* Flatline Detection Monitor */}
           <div className="glass-card">
             <h2 className="section-title">
-              <Activity size={20} color="var(--accent-purple)" /> Flatline Detection (dV/dt)
+              <Activity size={18} color="var(--accent-purple)" /> Flatline Detection
             </h2>
             <div className="info-item">
-              <span className="label">Voltage Check Interval</span>
-              <span className="value" style={{ color: 'var(--accent-cyan)' }}>10 Minutes</span>
+              <span className="label">Check Interval</span>
+              <span className="value text-cyan">10 min</span>
             </div>
             <div className="info-item">
-              <span className="label">Detection Start Threshold</span>
-              <span className="value">&gt; 14.5 V</span>
+              <span className="label">Start Threshold</span>
+              <span className="value">&gt; 14.5V</span>
             </div>
             <div className="info-item">
-              <span className="label">Flatline Status</span>
+              <span className="label">Status</span>
               <span className={`badge ${status?.flatlineDetected ? 'badge-danger' : 'badge-success'}`}>
-                {status?.flatlineDetected ? 'FLATLINE DETECTED (CUT-OFF)' : 'VOLTAGE RISING NORMAL'}
+                {status?.flatlineDetected ? 'DETECTED' : 'NORMAL'}
               </span>
             </div>
           </div>
 
-          {/* Smart Delay Timers */}
           <div className="glass-card">
             <h2 className="section-title">
-              <Clock size={20} color="var(--accent-yellow)" /> Smart Countdowns
+              <Timer size={18} color="var(--accent-yellow)" /> Smart Delays
             </h2>
             <div className="info-item">
-              <span className="label">Grid Return Delay Timer</span>
-              <span className="value">180 Seconds</span>
+              <span className="label">Grid Return Delay</span>
+              <span className="value">180s</span>
             </div>
             <div className="info-item">
-              <span className="label">Power Cut Delay Timer</span>
-              <span className="value">180 Seconds</span>
+              <span className="label">Power Cut Delay</span>
+              <span className="value">180s</span>
             </div>
           </div>
         </div>
       )}
 
-      {/* TAB 4: THRESHOLDS & CALIBRATION */}
+      {/* =================== TAB: THRESHOLDS =================== */}
       {activeTab === 'settings' && (
-        <div className="timers-grid">
-          <div className="glass-card" style={{ gridColumn: 'span 2' }}>
+        <div className="animate-in">
+          <div className="glass-card">
             <h2 className="section-title">
-              <SlidersHorizontal size={20} color="var(--accent-cyan)" /> Battery Charging Voltage Calibration
+              <SlidersHorizontal size={18} color="var(--accent-cyan)" /> Voltage Calibration
             </h2>
-            <div className="info-item">
-              <span className="label">BAT_CHARGE_START_THRESHOLD</span>
-              <span className="value">12.5 V (Start normal charge)</span>
-            </div>
-            <div className="info-item">
-              <span className="label">BAT_CHARGE_STOP_THRESHOLD</span>
-              <span className="value">15.5 V (Stop charge / Inverter OVP)</span>
-            </div>
-            <div className="info-item">
-              <span className="label">BAT_TOPUP_START_THRESHOLD</span>
-              <span className="value">14.5 V (5:30 PM & 1:00 AM Top-up)</span>
-            </div>
-            <div className="info-item">
-              <span className="label">CHARGING_OFFSET (Surface Charge)</span>
-              <span className="value">-0.5 V (Subtracted when SMPS active)</span>
-            </div>
-            <div className="info-item">
-              <span className="label">DVDT_START_VOLTAGE</span>
-              <span className="value">14.5 V (Flatline monitoring trigger)</span>
-            </div>
+            {[
+              { label: 'Charge Start', value: '12.5V', desc: 'Begin normal charging' },
+              { label: 'Charge Stop', value: '15.5V', desc: 'Stop at inverter OVP limit' },
+              { label: 'Top-Up Trigger', value: '14.5V', desc: 'Evening & night top-up threshold' },
+              { label: 'Surface Offset', value: '-0.5V', desc: 'Subtracted when SMPS active' },
+              { label: 'Flatline Trigger', value: '14.5V', desc: 'dV/dt monitoring starts' },
+            ].map((item, i) => (
+              <div className="info-item" key={i}>
+                <div>
+                  <span className="label">{item.label}</span>
+                  <div style={{ fontSize: '0.65rem', color: 'var(--text-dim)', marginTop: '0.1rem' }}>{item.desc}</div>
+                </div>
+                <span className="value text-cyan">{item.value}</span>
+              </div>
+            ))}
           </div>
         </div>
       )}
 
-      {/* TAB 5: EVENT LOGS */}
+      {/* =================== TAB: LOGS =================== */}
       {activeTab === 'logs' && (
-        <div className="glass-card">
+        <div className="glass-card animate-in">
           <h2 className="section-title">
-            <FileText size={20} color="var(--accent-blue)" /> System Event Stream & Logs
+            <FileText size={18} color="var(--accent-blue)" /> Event Stream
           </h2>
           <div className="log-stream-container">
             {logs.length === 0 ? (
-              <div style={{ color: 'var(--text-muted)' }}>No logs recorded yet.</div>
+              <div style={{ color: 'var(--text-muted)' }}>No events recorded.</div>
             ) : (
               logs.map(log => (
                 <div key={log.id} className="log-entry">
