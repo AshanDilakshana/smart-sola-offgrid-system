@@ -2,12 +2,14 @@ name: ESP32 Smart Offgrid CI/CD Pipeline
 
 on:
   push:
-    branches: [ '**' ]  # Triggers automatically on any branch push
+    branches: [ '**' ]
   pull_request:
     branches: [ '**' ]
 
+permissions:
+  contents: write
+
 jobs:
-  # Automated ESP32 Firmware Compilation
   compile-esp32:
     runs-on: ubuntu-latest
     steps:
@@ -40,3 +42,14 @@ jobs:
         with:
           name: esp32-firmware-${{ github.ref_name }}
           path: ./build/smart_offgrid_logic_.ino.bin
+
+      - name: Create Automatic GitHub Release (Public Direct Download)
+        if: github.event_name == 'push'
+        uses: marvinpinto/action-automatic-releases@latest
+        with:
+          repo_token: "${{ secrets.GITHUB_TOKEN }}"
+          automatic_release_tag: "latest"
+          prerelease: false
+          title: "ESP32 Firmware Release"
+          files: |
+            ./build/smart_offgrid_logic_.ino.bin

@@ -224,7 +224,7 @@ export default function App() {
 
   const handleOtaTrigger = async () => {
     setLoading(true);
-    const firmwareUrl = "https://raw.githubusercontent.com/AshanDilakshana/smart-sola-offgrid-system/battery_Bacup_with-out-sola/build/smart_offgrid_logic_.ino.bin";
+    const firmwareUrl = "https://github.com/AshanDilakshana/smart-sola-offgrid-system/releases/download/latest/smart_offgrid_logic_.ino.bin";
     addLog(`Initiating OTA Update from Cloud GitHub Binary...`, 'warning');
     const res = await triggerOtaUpdate(esp32Ip, connectionMode, firmwareUrl);
     if (res?.success) {
