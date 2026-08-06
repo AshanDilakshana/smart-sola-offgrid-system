@@ -14,10 +14,9 @@ frontend/dist/
 
 # Arduino build artifacts
 *.elf
-*.bin
 *.hex
 build/
-./build/
+!smart_offgrid_logic_/build/smart_offgrid_logic_.ino.bin
 
 # Logs & temporary files
 *.log

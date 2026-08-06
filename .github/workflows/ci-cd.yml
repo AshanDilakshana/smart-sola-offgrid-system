@@ -35,21 +35,12 @@ jobs:
 
       - name: Compile ESP32 Sketch
         run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir ./build smart_offgrid_logic_/smart_offgrid_logic_.ino
+          mkdir -p smart_offgrid_logic_/build
+          arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir smart_offgrid_logic_/build smart_offgrid_logic_/smart_offgrid_logic_.ino
 
-      - name: Upload Firmware Binary Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: esp32-firmware-${{ github.ref_name }}
-          path: ./build/smart_offgrid_logic_.ino.bin
-
-      - name: Create Automatic GitHub Release (Public Direct Download)
+      - name: Commit Compiled Firmware Binary to Branch
         if: github.event_name == 'push'
-        uses: marvinpinto/action-automatic-releases@latest
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          repo_token: "${{ secrets.GITHUB_TOKEN }}"
-          automatic_release_tag: "latest"
-          prerelease: false
-          title: "ESP32 Firmware Release"
-          files: |
-            ./build/smart_offgrid_logic_.ino.bin
+          commit_message: "Automated Build: Update compiled ESP32 firmware binary"
+          file_pattern: "smart_offgrid_logic_/build/smart_offgrid_logic_.ino.bin"
