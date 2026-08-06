@@ -24,7 +24,7 @@ const char* ssid = "SLT FIBER";
 const char* password = "@Ashan20030118";
 
 // Firmware Versioning
-const char* FIRMWARE_VERSION = "v1.0.3";
+const char* FIRMWARE_VERSION = "v1.0.4";
 
 // NTP Time Client
 WiFiUDP ntpUDP;
@@ -358,6 +358,7 @@ void syncFirebaseTask(void * pvParameters) {
                lastAppHeartbeatTime = millis();    // Reset the 3-hour timeout timer
             }
           }
+        }
         // Parse otaUrl if present (Cloud OTA Update Trigger)
         int otaIdx = payload.indexOf("\"otaUrl\":\"");
         if (otaIdx != -1) {
@@ -414,6 +415,7 @@ void syncFirebaseTask(void * pvParameters) {
         jsonPayload += "\"flatlineDetected\":" + String(flatlineDetected ? "true" : "false") + ",";
         jsonPayload += "\"wifiConnected\":true,";
         jsonPayload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+        jsonPayload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
         jsonPayload += "\"firmwareVersion\":\"" + String(FIRMWARE_VERSION) + "\",";
         jsonPayload += "\"sessionActive\":true";
         jsonPayload += "}";

@@ -66,6 +66,9 @@ export default function App() {
       const data = await fetchSystemStatus(esp32Ip, connectionMode);
       if (isMounted && data) {
         setStatus(data);
+        if (data.ip) {
+          setEsp32Ip(data.ip);
+        }
         setHistory(prev => {
           const next = [...prev, { time: new Date().toLocaleTimeString(), volt: data.batteryVoltage }];
           return next.slice(-60); // Keep 2 minutes of data (60 samples at 2s intervals)
@@ -286,14 +289,14 @@ export default function App() {
               />
             )}
             <button
-              className={`badge ${connectionMode === 'cloud' ? 'badge-info' : connectionMode === 'local' ? 'badge-warning' : 'badge-danger'}`}
+              className={`badge ${connectionMode === 'cloud' ? 'badge-info' : 'badge-warning'}`}
               onClick={() => {
-                const nextMode = connectionMode === 'cloud' ? 'local' : connectionMode === 'local' ? 'mock' : 'cloud';
+                const nextMode = connectionMode === 'cloud' ? 'local' : 'cloud';
                 setConnectionMode(nextMode);
                 addLog(`Mode: ${nextMode.toUpperCase()}`, 'info');
               }}
             >
-              {connectionMode === 'cloud' ? '🌐 Cloud' : connectionMode === 'local' ? '🏠 Local' : '🧪 Mock'}
+              {connectionMode === 'cloud' ? '🌐 Cloud' : '🏠 Local IP'}
             </button>
             <span className="badge badge-purple" title="ESP32 Firmware Version">
               {status?.firmwareVersion || 'v1.0.1'}
