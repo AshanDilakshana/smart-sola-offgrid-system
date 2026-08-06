@@ -669,11 +669,11 @@ export default function App() {
             </h2>
             <div className="info-item">
               <span className="label">Check Interval</span>
-              <span className="value text-cyan">10 min</span>
+              <span className="value text-cyan">5 min</span>
             </div>
             <div className="info-item">
               <span className="label">Start Threshold</span>
-              <span className="value">&gt; 14.5V</span>
+              <span className="value">&gt; 14.0V</span>
             </div>
             <div className="info-item">
               <span className="label">Status</span>
@@ -711,7 +711,7 @@ export default function App() {
               { label: 'Charge Stop', value: '15.5V', desc: 'Stop at inverter OVP limit' },
               { label: 'Top-Up Trigger', value: '14.5V', desc: 'Evening & night top-up threshold' },
               { label: 'Surface Offset', value: '-0.5V', desc: 'Subtracted when SMPS active' },
-              { label: 'Flatline Trigger', value: '14.5V', desc: 'dV/dt monitoring starts' },
+              { label: 'Flatline Trigger', value: '14.0V', desc: 'dV/dt monitoring starts' },
             ].map((item, i) => (
               <div className="info-item" key={i}>
                 <div>
