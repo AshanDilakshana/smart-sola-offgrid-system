@@ -69,10 +69,12 @@ export default function App() {
         if (data.ip) {
           setEsp32Ip(data.ip);
         }
-        setHistory(prev => {
-          const next = [...prev, { time: new Date().toLocaleTimeString(), volt: data.batteryVoltage }];
-          return next.slice(-60); // Keep 2 minutes of data (60 samples at 2s intervals)
-        });
+        if (data.isConnected && data.batteryVoltage !== undefined) {
+          setHistory(prev => {
+            const next = [...prev, { time: new Date().toLocaleTimeString(), volt: data.batteryVoltage }];
+            return next.slice(-60); // Keep 2 minutes of data (60 samples at 2s intervals)
+          });
+        }
 
         // Track inverter ON/OFF transitions
         const isOn = !!data.inverterState;
@@ -316,6 +318,21 @@ export default function App() {
           ))}
         </nav>
       </header>
+
+      {/* Connection Error Alert Banner */}
+      {status && status.isConnected === false && (
+        <div className="glass-card animate-in" style={{ borderColor: 'var(--accent-red)', background: 'rgba(239, 68, 68, 0.12)', color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '1rem 1.25rem' }}>
+          <AlertTriangle size={24} className="text-red" style={{ flexShrink: 0 }} />
+          <div>
+            <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--accent-red)' }}>
+              Connection Failed — Real-Time Telemetry Disconnected
+            </div>
+            <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginTop: '0.1rem' }}>
+              {status.error || 'Unable to communicate with ESP32 device. Please verify IP address or network connection.'}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* =================== TAB: OVERVIEW =================== */}
       {activeTab === 'overview' && (

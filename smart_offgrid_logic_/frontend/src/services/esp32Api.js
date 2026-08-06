@@ -69,10 +69,6 @@ async function sendAppHeartbeat() {
 }
 
 export async function fetchSystemStatus(esp32Ip, connectionMode = 'cloud') {
-  if (connectionMode === 'mock') {
-    return { ...mockState };
-  }
-
   if (connectionMode === 'cloud') {
     // Send active session heartbeat ping to wake up ESP32 live sync
     sendAppHeartbeat();
@@ -81,13 +77,13 @@ export async function fetchSystemStatus(esp32Ip, connectionMode = 'cloud') {
       const res = await fetch(`${FIREBASE_DB_URL}/status.json`);
       if (!res.ok) throw new Error('Firebase HTTP ' + res.status);
       const data = await res.json();
-      if (data) {
-        return { ...data, cloudConnected: true };
+      if (data && data.batteryVoltage !== undefined) {
+        return { ...data, cloudConnected: true, isConnected: true };
       }
-      return { ...mockState };
+      return { isConnected: false, error: 'No status data found on Firebase Cloud Database.' };
     } catch (err) {
-      console.warn('Firebase Cloud sync error, fallback to mock:', err.message);
-      return { ...mockState, connectionError: err.message };
+      console.warn('Firebase Cloud sync error:', err.message);
+      return { isConnected: false, error: 'Cloud Connection Failed: Unable to connect to Firebase.' };
     }
   }
 
@@ -103,10 +99,10 @@ export async function fetchSystemStatus(esp32Ip, connectionMode = 'cloud') {
 
     if (!res.ok) throw new Error('HTTP error ' + res.status);
     const data = await res.json();
-    return data;
+    return { ...data, isConnected: true };
   } catch (err) {
-    console.warn('ESP32 local connection failed, fallback to mock:', err.message);
-    return { ...mockState, connectionError: err.message };
+    console.warn('ESP32 local connection failed:', err.message);
+    return { isConnected: false, error: `Local Wi-Fi Connection Failed: Unable to reach ESP32 at IP http://${esp32Ip}` };
   }
 }
 
