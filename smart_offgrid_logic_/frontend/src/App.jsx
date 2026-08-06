@@ -283,6 +283,9 @@ export default function App() {
             >
               {connectionMode === 'cloud' ? '🌐 Cloud' : connectionMode === 'local' ? '🏠 Local' : '🧪 Mock'}
             </button>
+            <span className="badge badge-purple" title="ESP32 Firmware Version">
+              {status?.firmwareVersion || 'v1.0.1'}
+            </span>
           </div>
         </div>
 
