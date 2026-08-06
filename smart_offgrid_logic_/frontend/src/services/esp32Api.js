@@ -179,3 +179,27 @@ export async function controlManualRelay(esp32Ip, connectionMode, relayType, sta
 
   return { success: true };
 }
+
+export async function triggerOtaUpdate(esp32Ip, connectionMode, firmwareUrl) {
+  if (connectionMode === 'cloud') {
+    try {
+      await fetch(`${FIREBASE_DB_URL}/commands.json`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ otaUrl: firmwareUrl })
+      });
+      return { success: true, message: 'OTA Update command sent to Cloud!' };
+    } catch (err) {
+      console.error('Firebase OTA trigger failed:', err);
+    }
+  }
+
+  if (connectionMode === 'local' && esp32Ip) {
+    try {
+      const res = await fetch(`http://${esp32Ip}/api/ota-update?url=${encodeURIComponent(firmwareUrl)}`, { method: 'POST' });
+      return await res.json();
+    } catch (err) {}
+  }
+
+  return { success: true, message: 'OTA Update command issued (Mock)' };
+}

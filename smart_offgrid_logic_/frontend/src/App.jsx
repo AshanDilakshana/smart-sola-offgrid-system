@@ -31,7 +31,8 @@ import {
   fetchSystemStatus,
   setSystemMode,
   toggleForceCharging,
-  controlManualRelay
+  controlManualRelay,
+  triggerOtaUpdate
 } from './services/esp32Api';
 
 export default function App() {
@@ -213,6 +214,17 @@ export default function App() {
     setLoading(true);
     addLog(`Relay: ${relayType} → ${!currentState ? 'ON' : 'OFF'}`, 'action');
     await controlManualRelay(esp32Ip, connectionMode, relayType, !currentState);
+    setLoading(false);
+  };
+
+  const handleOtaTrigger = async () => {
+    setLoading(true);
+    const firmwareUrl = "https://raw.githubusercontent.com/AshanDilakshana/smart-sola-offgrid-system/battery_Bacup_with-out-sola/build/smart_offgrid_logic_.ino.bin";
+    addLog(`Initiating OTA Update from Cloud GitHub Binary...`, 'warning');
+    const res = await triggerOtaUpdate(esp32Ip, connectionMode, firmwareUrl);
+    if (res?.success) {
+      addLog(`OTA Update command sent! ESP32 downloading & flashing...`, 'success');
+    }
     setLoading(false);
   };
 
@@ -724,6 +736,35 @@ export default function App() {
                 <span className="value text-cyan">{item.value}</span>
               </div>
             ))}
+          </div>
+
+          {/* OTA Firmware Update Card */}
+          <div className="glass-card" style={{ marginTop: '1rem' }}>
+            <h2 className="section-title">
+              <CloudLightning size={18} color="var(--accent-purple)" /> Over-The-Air (OTA) Firmware Update
+            </h2>
+            <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
+              Download and flash the latest compiled firmware binary directly to the ESP32 chip over Wi-Fi.
+            </p>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem' }}>
+              <div>
+                <div style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--text-main)' }}>
+                  Current Device Version: <span className="text-purple">{status?.firmwareVersion || 'v1.0.1'}</span>
+                </div>
+                <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginTop: '0.2rem' }}>
+                  Target: Latest GitHub Actions Artifact (battery_Bacup_with-out-sola)
+                </div>
+              </div>
+              <button
+                className="btn-force-charge"
+                style={{ background: 'linear-gradient(135deg, var(--accent-purple), var(--accent-indigo))', color: '#fff' }}
+                onClick={handleOtaTrigger}
+                disabled={loading}
+              >
+                <CloudLightning size={18} />
+                {loading ? 'SENDING OTA COMMAND...' : 'INSTALL LATEST FIRMWARE (OTA)'}
+              </button>
+            </div>
           </div>
         </div>
       )}

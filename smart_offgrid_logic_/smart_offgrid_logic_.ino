@@ -24,7 +24,7 @@ const char* ssid = "SLT FIBER";
 const char* password = "@Ashan20030118";
 
 // Firmware Versioning
-const char* FIRMWARE_VERSION = "v1.0.2";
+const char* FIRMWARE_VERSION = "v1.0.3";
 
 // NTP Time Client
 WiFiUDP ntpUDP;
@@ -356,6 +356,29 @@ void syncFirebaseTask(void * pvParameters) {
             if (hbValue != lastReceivedHeartbeatStr) {
                lastReceivedHeartbeatStr = hbValue; // Update tracker
                lastAppHeartbeatTime = millis();    // Reset the 3-hour timeout timer
+            }
+          }
+        // Parse otaUrl if present (Cloud OTA Update Trigger)
+        int otaIdx = payload.indexOf("\"otaUrl\":\"");
+        if (otaIdx != -1) {
+          int endOta = payload.indexOf("\"", otaIdx + 10);
+          if (endOta != -1) {
+            String otaUrl = payload.substring(otaIdx + 10, endOta);
+            if (otaUrl.length() > 10) {
+              Serial.println("OTA Command received from Cloud! Downloading: " + otaUrl);
+              // Clear otaUrl in Firebase so it doesn't loop
+              http.end();
+              http.begin(client, "https://my-smart-off-grid-default-rtdb.firebaseio.com/commands.json");
+              http.addHeader("Content-Type", "application/json");
+              http.PATCH("{\"otaUrl\":\"\"}");
+              http.end();
+
+              // Perform OTA Update
+              t_httpUpdate_return ret = httpUpdate.update(client, otaUrl);
+              if (ret == HTTP_UPDATE_OK) {
+                Serial.println("OTA Update Successful! Restarting ESP32...");
+                ESP.restart();
+              }
             }
           }
         }
