@@ -24,7 +24,7 @@ const char* ssid = "SLT FIBER";
 const char* password = "@Ashan20030118";
 
 // Firmware Versioning
-const char* FIRMWARE_VERSION = "v1.0.4";
+const char* FIRMWARE_VERSION = "v1.0.5";
 
 // NTP Time Client
 WiFiUDP ntpUDP;
