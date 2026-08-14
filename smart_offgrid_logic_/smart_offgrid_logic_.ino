@@ -90,7 +90,7 @@ unsigned long lastVoltageCheckTime = 0;
 float lastRecordedVoltage = 0.0;
 bool flatlineDetected = false;
 const unsigned long VOLTAGE_CHECK_INTERVAL = 300000; // 5 minutes (300,000 ms)
-const float DVDT_START_VOLTAGE = 14.0; // Only check after reaching 14.0V
+const float DVDT_START_VOLTAGE = 13.5; // Only check after reaching 13.5V
 
 // --- Software Grid Debounce Variables ---
 unsigned long lastGridDebounceTime = 0;
