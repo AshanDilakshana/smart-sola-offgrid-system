@@ -9,6 +9,10 @@
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <WiFiClientSecure.h>
+#include "JK_BMS.h"
+
+JKBMS jkbms;
+unsigned long lastBmsRequest = 0;
 
 // OLED Display Settings
 #define SCREEN_WIDTH 128
@@ -36,7 +40,6 @@ WebServer server(80);
 // ---------------------------------------------------------
 // ESP32 PIN Definitions
 // ---------------------------------------------------------
-const int BATTERY_PIN = 34;   
 const int SOLAR_PIN   = 32; 
 
 const int INV_RELAY   = 25;   
@@ -47,11 +50,6 @@ const int ECO_SWITCH    = 14;
 const int PCUT_SWITCH   = 27; 
 const int MANUAL_SWITCH = 13; 
 
-// Voltage Divider Calibration
-const float R1 = 100000.0; 
-const float R2 = 10000.0;  
-const float V_REF = 3.7589;   // Recalibrated: 3.7784 * (15.47 / 15.55)
-const float CHARGING_OFFSET = 0.5; // Offset to subtract when SMPS charging is active (surface charge correction)
 
 // --- Easy Timer Configuration ---
 const unsigned long TIMER_DELAY_MS = 180000; 
@@ -116,8 +114,15 @@ const unsigned long ACTIVE_SESSION_TIMEOUT_MS = 10800000; // 3 Hours (10,800,000
 bool isAppSessionActive = true;
 TaskHandle_t FirebaseTaskHandle;
 
+// --- 15-Minute Periodic History Logging ---
+unsigned long lastHistoryLogTime = 0;
+const unsigned long HISTORY_LOG_INTERVAL = 900000; // 15 minutes (900,000 ms)
+
 void setup() {
   Serial.begin(115200);
+
+  // Initialize JK BMS on Serial2 (RX=4, TX=5)
+  jkbms.begin(Serial2, 4, 5);
 
   // ADC Settings
   analogSetAttenuation(ADC_11db);
@@ -186,28 +191,9 @@ void setup() {
 // 🛠️ NOISE FILTERED VOLTAGE FUNCTIONS
 // ---------------------------------------------------------
 float getBatteryVoltage() {
-  long sum = 0;
-  int samples = 200; 
-  
-  for (int i = 0; i < samples; i++) {
-    sum += analogRead(BATTERY_PIN);
-    delayMicroseconds(50); 
-  }
-  
-  float raw = (float)sum / samples;
-  float v_out = (raw * V_REF) / 4095.0; 
-  float newVolt = v_out * ((R1 + R2) / R2);
-
-  // Apply calibration offset if charger is active (compensation for voltage rise under charge)
-  if (smpsState) {
-    newVolt -= CHARGING_OFFSET;
-  }
-
-  // EMA Low-Pass Filter for high stability
-  if (lastBatVolt == 0.0) {
-    lastBatVolt = newVolt;
-  } else {
-    lastBatVolt = (0.05 * newVolt) + (0.95 * lastBatVolt);
+  // Return the voltage parsed from the JK BMS
+  if (jkbms.dataValid) {
+    lastBatVolt = jkbms.voltage;
   }
   return lastBatVolt;
 }
@@ -246,6 +232,9 @@ void drawWiFiBars(int x, int y) {
 void handleGetStatus() {
   String json = "{";
   json += "\"batteryVoltage\":" + String(lastBatVolt, 2) + ",";
+  json += "\"batteryCurrent\":" + String(jkbms.current, 2) + ",";
+  json += "\"batterySoc\":" + String(jkbms.soc) + ",";
+  json += "\"cellVoltages\":[" + String(jkbms.cellVoltages[0], 3) + "," + String(jkbms.cellVoltages[1], 3) + "," + String(jkbms.cellVoltages[2], 3) + "," + String(jkbms.cellVoltages[3], 3) + "],";
   json += "\"solarVoltage\":" + String(lastSolVolt, 2) + ",";
   json += "\"gridPresent\":" + String(debouncedGridState ? "true" : "false") + ",";
   json += "\"inverterState\":" + String(inverterState ? "true" : "false") + ",";
@@ -402,6 +391,9 @@ void syncFirebaseTask(void * pvParameters) {
 
         String jsonPayload = "{";
         jsonPayload += "\"batteryVoltage\":" + String(lastBatVolt, 2) + ",";
+        jsonPayload += "\"batteryCurrent\":" + String(jkbms.current, 2) + ",";
+        jsonPayload += "\"batterySoc\":" + String(jkbms.soc) + ",";
+        jsonPayload += "\"cellVoltages\":[" + String(jkbms.cellVoltages[0], 3) + "," + String(jkbms.cellVoltages[1], 3) + "," + String(jkbms.cellVoltages[2], 3) + "," + String(jkbms.cellVoltages[3], 3) + "],";
         jsonPayload += "\"solarVoltage\":" + String(lastSolVolt, 2) + ",";
         jsonPayload += "\"gridPresent\":" + String(debouncedGridState ? "true" : "false") + ",";
         jsonPayload += "\"inverterState\":" + String(inverterState ? "true" : "false") + ",";
@@ -423,6 +415,31 @@ void syncFirebaseTask(void * pvParameters) {
         http.PUT(jsonPayload);
         http.end();
       }
+
+      // 3. Periodic 15-Minute History Logging to Firebase Database
+      if (lastHistoryLogTime == 0 || (millis() - lastHistoryLogTime >= HISTORY_LOG_INTERVAL)) {
+        lastHistoryLogTime = millis();
+        String historyUrl = "https://my-smart-off-grid-default-rtdb.firebaseio.com/history.json";
+        http.begin(client, historyUrl);
+        http.addHeader("Content-Type", "application/json");
+
+        String histPayload = "{";
+        histPayload += "\"epoch\":" + String(timeClient.getEpochTime()) + ",";
+        histPayload += "\"time\":\"" + timeClient.getFormattedTime() + "\",";
+        histPayload += "\"batteryVoltage\":" + String(lastBatVolt, 2) + ",";
+        histPayload += "\"batteryCurrent\":" + String(jkbms.current, 2) + ",";
+        histPayload += "\"batterySoc\":" + String(jkbms.soc) + ",";
+        histPayload += "\"cellVoltages\":[" + String(jkbms.cellVoltages[0], 3) + "," + String(jkbms.cellVoltages[1], 3) + "," + String(jkbms.cellVoltages[2], 3) + "," + String(jkbms.cellVoltages[3], 3) + "],";
+        histPayload += "\"solarVoltage\":" + String(lastSolVolt, 2) + ",";
+        histPayload += "\"gridPresent\":" + String(debouncedGridState ? "true" : "false") + ",";
+        histPayload += "\"inverterState\":" + String(inverterState ? "true" : "false") + ",";
+        histPayload += "\"smpsState\":" + String(smpsState ? "true" : "false") + ",";
+        histPayload += "\"mode\":\"" + currentModeString + "\"";
+        histPayload += "}";
+
+        http.POST(histPayload);
+        http.end();
+      }
     }
     
     // Wait 2.5 seconds before the next Firebase sync
@@ -434,6 +451,15 @@ void syncFirebaseTask(void * pvParameters) {
 void loop() {
   // Handle local web server requests
   server.handleClient();
+
+  // Read incoming BMS data constantly
+  jkbms.readData(Serial2);
+
+  // Request new data from BMS every 2 seconds
+  if (millis() - lastBmsRequest >= 2000) {
+    jkbms.requestData(Serial2);
+    lastBmsRequest = millis();
+  }
 
 
   String displayTime = "--:--";
@@ -500,7 +526,7 @@ void loop() {
   String modeString = "POWER OFF"; 
   String errorString = ""; 
 
-  if (batVolt < 5.0) {
+  if (batVolt < 5.0 || !jkbms.dataValid) {
     errorString = "BAT WIRE FAULT"; 
   }
 
@@ -649,6 +675,7 @@ void loop() {
       normalChargingActive = true;
     }
 
+
     // --- Flatline Detection Logic ---
     if (topup530Active || topup1amActive || normalChargingActive) {
       if (batVolt >= DVDT_START_VOLTAGE) {
@@ -673,7 +700,6 @@ void loop() {
       lastRecordedVoltage = 0.0;
       flatlineDetected = false;
     }
-
     // --- SMPS STATE EVALUATION & OFF CONDITIONS ---
     if (topup530Active) {
       smpsState = true;
