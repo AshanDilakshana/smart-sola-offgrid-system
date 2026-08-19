@@ -3,11 +3,14 @@
 const FIREBASE_DB_URL = "https://my-smart-off-grid-default-rtdb.firebaseio.com";
 
 let mockState = {
-  batteryVoltage: 13.4,
+  batteryVoltage: 14.4,
+  batteryCurrent: 2.5,
+  batterySoc: 88,
+  cellVoltages: [3.601, 3.598, 3.595, 3.594],
   solarVoltage: 0.0,
   gridPresent: true,
   inverterState: false,
-  smpsState: false,
+  smpsState: true,
   modeString: 'POWER OFF',
   webModeOverride: -1,
   forceChargingActive: false,
@@ -22,7 +25,7 @@ let mockState = {
   batStartThreshold: 12.5,
   batStopThreshold: 15.5,
   batTopupThreshold: 14.5,
-  firmwareVersion: 'v1.0.1'
+  firmwareVersion: 'v1.0.5'
 };
 
 // Internal simulation ticker for standalone offline testing
@@ -198,4 +201,46 @@ export async function triggerOtaUpdate(esp32Ip, connectionMode, firmwareUrl) {
   }
 
   return { success: true, message: 'OTA Update command issued (Mock)' };
+}
+
+export async function fetchHistory(connectionMode) {
+  if (connectionMode === 'cloud') {
+    try {
+      const res = await fetch(`${FIREBASE_DB_URL}/history.json`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data) {
+          // Firebase returns an object with push keys, convert to sorted array
+          return Object.values(data).sort((a, b) => a.epoch - b.epoch);
+        }
+      }
+    } catch (err) {
+      console.warn('Firebase history fetch failed:', err);
+    }
+  }
+
+  // Standalone mode mock data generator: 7 days of 15-min intervals
+  const mockHistory = [];
+  const now = Math.floor(Date.now() / 1000);
+  const intervals = 7 * 24 * 4; 
+  
+  for (let i = intervals; i >= 0; i--) {
+    const epoch = now - (i * 900);
+    const hour = new Date(epoch * 1000).getHours();
+    const isDay = hour >= 7 && hour <= 17;
+    // Inject some manual mode deep discharge events
+    const isManualEvent = Math.random() > 0.95; 
+    
+    mockHistory.push({
+      epoch: epoch,
+      batteryVoltage: isManualEvent ? 12.4 : (isDay ? 14.1 : 12.8),
+      inverterState: isManualEvent ? true : Math.random() > 0.3,
+      mode: isManualEvent ? 'MANUAL' : 'ECO MODE',
+      // Extra fields for robustness
+      batterySoc: isDay ? 90 : 50,
+      gridPresent: false
+    });
+  }
+  
+  return mockHistory;
 }

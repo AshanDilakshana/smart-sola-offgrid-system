@@ -32,7 +32,8 @@ import {
   setSystemMode,
   toggleForceCharging,
   controlManualRelay,
-  triggerOtaUpdate
+  triggerOtaUpdate,
+  fetchHistory
 } from './services/esp32Api';
 
 export default function App() {
@@ -43,6 +44,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState([]);
   const [logs, setLogs] = useState([]);
+  const [dailyHistory, setDailyHistory] = useState([]); // Array of daily aggregated data
 
   // Inverter uptime tracking
   const [inverterOnTime, setInverterOnTime] = useState(0); // seconds
@@ -108,6 +110,46 @@ export default function App() {
       if (inverterTimerRef.current) clearInterval(inverterTimerRef.current);
     };
   }, [esp32Ip, connectionMode]);
+
+  // Fetch long-term history once on mount or when mode changes
+  useEffect(() => {
+    let isMounted = true;
+    async function loadHistory() {
+      const histData = await fetchHistory(connectionMode);
+      if (!isMounted || !histData) return;
+      
+      // Aggregate into daily buckets
+      const dailyMap = {};
+      histData.forEach(h => {
+        const dateObj = new Date(h.epoch * 1000);
+        // Format YYYY-MM-DD
+        const dateStr = dateObj.toLocaleDateString();
+        const shortDay = dateObj.toLocaleDateString('en-US', { weekday: 'short' });
+        
+        if (!dailyMap[dateStr]) {
+          dailyMap[dateStr] = {
+            dateStr,
+            shortDay,
+            uptimeChunks: 0,
+            deepDischargeCount: 0
+          };
+        }
+        
+        if (h.inverterState) {
+          dailyMap[dateStr].uptimeChunks += 1;
+          
+          if (h.mode === 'MANUAL' && h.batteryVoltage <= 12.5) {
+            dailyMap[dateStr].deepDischargeCount += 1;
+          }
+        }
+      });
+      
+      // Convert map to array and take last 7 days
+      const sortedDays = Object.values(dailyMap).slice(-7);
+      setDailyHistory(sortedDays);
+    }
+    loadHistory();
+  }, [connectionMode]);
 
   // Format seconds to HH:MM:SS
   const formatTime = (totalSec) => {
@@ -192,8 +234,13 @@ export default function App() {
   };
 
   const handleModeChange = async (modeVal) => {
-    setLoading(true);
     const modeNames = { '-1': 'AUTO', '0': 'POWER OFF', '1': 'ECO', '2': 'POWER CUT', '3': 'ECO+PCUT', '4': 'MANUAL' };
+    
+    // Request confirmation from the user
+    const confirmed = window.confirm(`Are you sure you want to change the system mode to ${modeNames[modeVal] || 'this mode'}?`);
+    if (!confirmed) return;
+
+    setLoading(true);
     addLog(`Mode → ${modeNames[modeVal] || modeVal}`, 'action');
     const res = await setSystemMode(esp32Ip, connectionMode, modeVal);
     if (res?.success) {
@@ -388,27 +435,26 @@ export default function App() {
             </div>
           </div>
 
-          {/* Battery Hero Gauge */}
+          {/* Battery Hero Gauge with Combined Voltage & Amps Meter */}
           <div className="battery-hero glass-card">
             <div className="battery-info">
               <div className="battery-info-header">
                 <Battery size={18} color="var(--accent-cyan)" />
-                <span>Battery Bank</span>
+                <span>Battery Bank & Live Flow</span>
               </div>
               <div className="battery-voltage">
-                {batVolt.toFixed(1)}<span className="unit">V</span>
+                {batVolt.toFixed(2)}<span className="unit">V</span>
               </div>
-              <p className="battery-soc-text">
-                State of Charge: <strong>{soc}%</strong>
-              </p>
+
+
               <div className="battery-badges">
                 {status?.smpsState && (
                   <span className="badge badge-info">
-                    <RefreshCw size={11} className="spin" /> Charging
+                    <RefreshCw size={11} className="spin" /> SMPS Active
                   </span>
                 )}
-                <span className={`badge ${status?.smpsState ? 'badge-info' : soc > 30 ? 'badge-success' : 'badge-danger'}`}>
-                  {status?.smpsState ? '⚡ SMPS Active' : soc > 30 ? '✓ Healthy' : '⚠ Low'}
+                <span className={`badge ${status?.smpsState || (status?.batteryCurrent || 0) < -0.05 ? 'badge-info' : soc > 30 ? 'badge-success' : 'badge-danger'}`}>
+                  {status?.smpsState || (status?.batteryCurrent || 0) < -0.05 ? '⚡ Charging Bank' : soc > 30 ? '✓ Bank Healthy' : '⚠ Bank Low'}
                 </span>
                 {status?.forceChargingActive && (
                   <span className="badge badge-warning">Force Charge</span>
@@ -416,52 +462,162 @@ export default function App() {
               </div>
             </div>
 
-            <div className="svg-gauge-wrapper">
-              <svg width="200" height="200" viewBox="0 0 200 200">
-                <circle
-                  cx="100" cy="100" r={radius}
-                  fill="none"
-                  stroke="rgba(255,255,255,0.04)"
-                  strokeWidth="12"
-                  strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
-                  transform="rotate(135 100 100)"
-                />
-                <circle
-                  cx="100" cy="100" r={radius}
-                  fill="none"
-                  stroke={status?.smpsState ? 'url(#cyanGrad)' : soc > 60 ? 'url(#greenGrad)' : soc > 30 ? 'url(#yellowGrad)' : 'url(#redGrad)'}
-                  strokeWidth="12"
-                  strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
-                  strokeDashoffset={strokeDashoffset}
-                  strokeLinecap="round"
-                  transform="rotate(135 100 100)"
-                  style={{ transition: 'stroke-dashoffset 1s cubic-bezier(0.4, 0, 0.2, 1)' }}
-                />
-                <defs>
-                  <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" stopColor="#38bdf8" />
-                    <stop offset="100%" stopColor="#6366f1" />
-                  </linearGradient>
-                  <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" stopColor="#22c55e" />
-                    <stop offset="100%" stopColor="#10b981" />
-                  </linearGradient>
-                  <linearGradient id="yellowGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" stopColor="#eab308" />
-                    <stop offset="100%" stopColor="#f59e0b" />
-                  </linearGradient>
-                  <linearGradient id="redGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" stopColor="#ef4444" />
-                    <stop offset="100%" stopColor="#f97316" />
-                  </linearGradient>
-                </defs>
-              </svg>
-              <div className="svg-gauge-text">
-                <div className="svg-gauge-val" style={{ color: getSocColor() }}>
-                  {soc}%
+            <div className="gauges-container" style={{ display: 'flex', gap: '2rem', flexWrap: 'wrap', justifyContent: 'center' }}>
+              {/* Voltage & SOC Gauge */}
+              <div className="svg-gauge-wrapper">
+                <svg width="100%" height="100%" viewBox="0 0 200 200">
+                  <circle
+                    cx="100" cy="100" r={radius}
+                    fill="none"
+                    stroke="rgba(255,255,255,0.04)"
+                    strokeWidth="14"
+                    strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
+                    transform="rotate(135 100 100)"
+                  />
+                  <circle
+                    cx="100" cy="100" r={radius}
+                    fill="none"
+                    stroke={soc > 60 ? 'url(#greenGrad)' : soc > 30 ? 'url(#yellowGrad)' : 'url(#redGrad)'}
+                    strokeWidth="14"
+                    strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
+                    strokeDashoffset={strokeDashoffset}
+                    strokeLinecap="round"
+                    transform="rotate(135 100 100)"
+                    style={{ transition: 'stroke-dashoffset 1s cubic-bezier(0.4, 0, 0.2, 1)' }}
+                  />
+                  <defs>
+                    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                      <stop offset="0%" stopColor="#38bdf8" />
+                      <stop offset="100%" stopColor="#6366f1" />
+                    </linearGradient>
+                    <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                      <stop offset="0%" stopColor="#22c55e" />
+                      <stop offset="100%" stopColor="#10b981" />
+                    </linearGradient>
+                    <linearGradient id="yellowGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                      <stop offset="0%" stopColor="#eab308" />
+                      <stop offset="100%" stopColor="#f59e0b" />
+                    </linearGradient>
+                    <linearGradient id="redGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                      <stop offset="0%" stopColor="#ef4444" />
+                      <stop offset="100%" stopColor="#f97316" />
+                    </linearGradient>
+                  </defs>
+                </svg>
+                <div className="svg-gauge-text">
+                  <div className="svg-gauge-val" style={{ color: getSocColor() }}>
+                    {batVolt.toFixed(1)}<span>V</span>
+                  </div>
+                  <div className="svg-gauge-sub">SOC: {status?.batterySoc ?? soc}%</div>
                 </div>
-                <div className="svg-gauge-sub">{batVolt.toFixed(1)}V DC</div>
               </div>
+
+              {/* Amperage Gauge */}
+              <div className="svg-gauge-wrapper">
+                <svg width="100%" height="100%" viewBox="0 0 200 200">
+                  <circle
+                    cx="100" cy="100" r={radius}
+                    fill="none"
+                    stroke="rgba(255,255,255,0.04)"
+                    strokeWidth="14"
+                    strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
+                    transform="rotate(135 100 100)"
+                  />
+                  <circle
+                    cx="100" cy="100" r={radius}
+                    fill="none"
+                    stroke={(status?.batteryCurrent || 0) < -0.05 ? 'url(#greenGrad)' : (status?.batteryCurrent || 0) > 0.05 ? 'url(#redGrad)' : 'url(#cyanGrad)'}
+                    strokeWidth="14"
+                    strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
+                    strokeDashoffset={circumference * 0.75 - ((circumference * 0.75) * Math.min(100, (Math.abs(status?.batteryCurrent || 0) / 30) * 100)) / 100}
+                    strokeLinecap="round"
+                    transform="rotate(135 100 100)"
+                    style={{ transition: 'stroke-dashoffset 1s cubic-bezier(0.4, 0, 0.2, 1)' }}
+                  />
+                </svg>
+                <div className="svg-gauge-text">
+                  <div className="svg-gauge-val" style={{ color: (status?.batteryCurrent || 0) < -0.05 ? 'var(--accent-green)' : (status?.batteryCurrent || 0) > 0.05 ? 'var(--accent-red)' : 'var(--accent-cyan)' }}>
+                    {Math.abs(status?.batteryCurrent || 0).toFixed(1)}<span>A</span>
+                  </div>
+                  <div className="svg-gauge-sub" style={{ color: (status?.batteryCurrent || 0) < -0.05 ? 'var(--accent-green)' : (status?.batteryCurrent || 0) > 0.05 ? 'var(--accent-red)' : 'var(--text-muted)' }}>
+                    {(status?.batteryCurrent || 0) < -0.05 ? 'Charging Amps' : (status?.batteryCurrent || 0) > 0.05 ? 'Discharge Amps' : 'Idle Amps'}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* =================== 4-CELL VOLTAGE BALANCE BAR CHART =================== */}
+          <div className="cell-balance-card glass-card">
+            <div className="cell-balance-header">
+              <div className="cell-balance-title">
+                <BatteryCharging size={18} color="var(--accent-cyan)" />
+                <span>4-Cell Lithium Balance Monitor</span>
+              </div>
+
+              {(() => {
+                const cells = status?.cellVoltages && status.cellVoltages.length >= 4 ? status.cellVoltages : [3.60, 3.59, 3.59, 3.60];
+                const valid = cells.filter(v => v > 1.0);
+                const minV = valid.length ? Math.min(...valid) : 3.59;
+                const maxV = valid.length ? Math.max(...valid) : 3.60;
+                const delta = (maxV - minV).toFixed(3);
+                return (
+                  <div className="cell-balance-delta">
+                    <span className="badge badge-purple" title="Max cell difference">
+                      ΔV: {delta} V
+                    </span>
+                    <span className={`badge ${parseFloat(delta) < 0.03 ? 'badge-success' : parseFloat(delta) < 0.08 ? 'badge-warning' : 'badge-danger'}`}>
+                      {parseFloat(delta) < 0.03 ? '✓ Perfect Balance' : parseFloat(delta) < 0.08 ? '⚡ Balancing' : '⚠ Imbalanced'}
+                    </span>
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* 4 Cell Bars Grid */}
+            <div className="cell-bars-grid">
+              {[0, 1, 2, 3].map((idx) => {
+                const cells = status?.cellVoltages && status.cellVoltages.length > idx && status.cellVoltages[idx] > 1.0 
+                  ? status.cellVoltages 
+                  : [3.601, 3.598, 3.595, 3.594];
+                const v = cells[idx] || 3.60;
+                // Scale from 2.80V to 3.65V (LiFePO4 cell range)
+                const pct = Math.min(100, Math.max(5, Math.round(((v - 2.80) / (3.65 - 2.80)) * 100)));
+                const barColor = v >= 3.45 ? 'linear-gradient(90deg, #38bdf8, #22c55e)' : v >= 3.20 ? 'linear-gradient(90deg, #22c55e, #10b981)' : v >= 3.00 ? 'linear-gradient(90deg, #eab308, #f59e0b)' : 'linear-gradient(90deg, #ef4444, #f97316)';
+
+                return (
+                  <div key={idx} className="cell-item">
+                    <div className="cell-top-row">
+                      <span className="cell-badge-num">
+                        <Battery size={12} color="var(--accent-cyan)" /> Cell {idx + 1}
+                      </span>
+                      <span className="badge badge-info" style={{ padding: '0.15rem 0.45rem', fontSize: '0.65rem' }}>
+                        {pct}%
+                      </span>
+                    </div>
+
+                    <div className="cell-volt-val">
+                      {v.toFixed(3)}<span className="unit">V</span>
+                    </div>
+
+                    <div className="cell-bar-track">
+                      <div 
+                        className="cell-bar-fill" 
+                        style={{ 
+                          width: `${pct}%`, 
+                          background: barColor,
+                          boxShadow: `0 0 10px ${v >= 3.3 ? 'rgba(34, 197, 94, 0.35)' : 'rgba(234, 179, 8, 0.35)'}`
+                        }} 
+                      />
+                    </div>
+
+                    <div className="cell-footer-row">
+                      <span>2.80V min</span>
+                      <span>3.65V max</span>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
 
@@ -551,47 +707,52 @@ export default function App() {
               </div>
             </div>
 
-            {/* Inverter Uptime Tracker */}
+            {/* Daily Inverter Uptime Bar Chart */}
             <div className="glass-card chart-card">
               <div className="card-header">
-                <span className="card-label">Inverter Uptime</span>
-                <Clock3 size={16} color={status?.inverterState ? 'var(--accent-green)' : 'var(--text-muted)'} />
+                <span className="card-label">7-Day Inverter Uptime</span>
+                <Clock3 size={16} color="var(--accent-cyan)" />
               </div>
 
-              {/* Current session timer */}
-              <div className="inverter-timer-display">
-                <div className={`inverter-timer-value ${status?.inverterState ? 'active' : ''}`}>
-                  {status?.inverterState && <div className="pulse-dot green" style={{ marginRight: '0.5rem' }}></div>}
-                  {formatTime(inverterOnTime)}
-                </div>
-                <div className="inverter-timer-label">
-                  {status?.inverterState ? 'Running now' : 'Inverter OFF'}
-                </div>
-              </div>
-
-              {/* Session history bars */}
-              <div className="inverter-sessions">
-                {inverterSessions.length === 0 ? (
-                  <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', textAlign: 'center', padding: '0.5rem 0' }}>
-                    No completed sessions yet
+              <div className="bar-chart-container">
+                {dailyHistory.length === 0 ? (
+                  <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.8rem', padding: '2rem 0' }}>
+                    Loading history...
                   </div>
                 ) : (
-                  inverterSessions.map((s, i) => {
-                    const maxDur = Math.max(...inverterSessions.map(x => x.duration), 1);
-                    const barWidth = Math.max(8, (s.duration / maxDur) * 100);
-                    return (
-                      <div key={i} className="session-row">
-                        <span className="session-time">{s.start}</span>
-                        <div className="session-bar-track">
-                          <div className="session-bar-fill" style={{ width: `${barWidth}%` }}></div>
+                  <div className="bar-chart">
+                    {dailyHistory.map((day, idx) => {
+                      // 1 chunk = 15 mins. Max expected per day = 24h = 96 chunks
+                      const hours = (day.uptimeChunks * 15) / 60;
+                      const heightPercent = Math.min(100, (hours / 24) * 100);
+                      const hasDeepDischarge = day.deepDischargeCount > 0;
+                      
+                      return (
+                        <div key={idx} className="bar-item">
+                          <div className="bar-fill-wrapper">
+                            <div 
+                              className={`bar-fill ${hasDeepDischarge ? 'danger' : 'normal'}`}
+                              style={{ height: `${heightPercent}%` }}
+                            >
+                              <span className="bar-value">{hours > 0 ? hours.toFixed(1) + 'h' : ''}</span>
+                            </div>
+                          </div>
+                          <div className="bar-label">{day.shortDay}</div>
+                          {hasDeepDischarge && (
+                            <div className="bar-event-badge" title={`${day.deepDischargeCount} deep discharges in Manual mode`}>!</div>
+                          )}
                         </div>
-                        <span className="session-duration">{formatTime(s.duration)}</span>
-                      </div>
-                    );
-                  })
+                      );
+                    })}
+                  </div>
                 )}
               </div>
+              <div className="chart-footer">
+                <span>Daily Total Hours</span>
+                <span><strong style={{color: 'var(--accent-red)'}}>!</strong> = Deep Discharge in Manual Mode</span>
+              </div>
             </div>
+
           </div>
         </div>
       )}
@@ -737,26 +898,6 @@ export default function App() {
       {/* =================== TAB: THRESHOLDS =================== */}
       {activeTab === 'settings' && (
         <div className="animate-in">
-          <div className="glass-card">
-            <h2 className="section-title">
-              <SlidersHorizontal size={18} color="var(--accent-cyan)" /> Voltage Calibration
-            </h2>
-            {[
-              { label: 'Charge Start', value: '12.5V', desc: 'Begin normal charging' },
-              { label: 'Charge Stop', value: '15.5V', desc: 'Stop at inverter OVP limit' },
-              { label: 'Top-Up Trigger', value: '14.5V', desc: 'Evening & night top-up threshold' },
-              { label: 'Surface Offset', value: '-0.5V', desc: 'Subtracted when SMPS active' },
-              { label: 'Flatline Trigger', value: '14.0V', desc: 'dV/dt monitoring starts' },
-            ].map((item, i) => (
-              <div className="info-item" key={i}>
-                <div>
-                  <span className="label">{item.label}</span>
-                  <div style={{ fontSize: '0.65rem', color: 'var(--text-dim)', marginTop: '0.1rem' }}>{item.desc}</div>
-                </div>
-                <span className="value text-cyan">{item.value}</span>
-              </div>
-            ))}
-          </div>
 
           {/* OTA Firmware Update Card */}
           <div className="glass-card" style={{ marginTop: '1rem' }}>

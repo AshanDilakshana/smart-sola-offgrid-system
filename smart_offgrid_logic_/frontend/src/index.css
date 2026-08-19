@@ -450,8 +450,8 @@ body::before {
 /* Circular SVG Gauge */
 .svg-gauge-wrapper {
   position: relative;
-  width: 200px;
-  height: 200px;
+  width: 230px;
+  height: 230px;
   flex-shrink: 0;
   z-index: 1;
 }
@@ -465,17 +465,22 @@ body::before {
 }
 
 .svg-gauge-val {
-  font-size: 2.5rem;
+  font-size: 2.4rem;
   font-weight: 800;
   font-family: var(--font-mono);
   line-height: 1;
   letter-spacing: -0.02em;
 }
 
+.svg-gauge-val span {
+  font-size: 1.2rem;
+  margin-left: 2px;
+}
+
 .svg-gauge-sub {
-  font-size: 0.75rem;
+  font-size: 0.9rem;
   color: var(--text-muted);
-  margin-top: 0.15rem;
+  margin-top: 0.2rem;
   font-weight: 500;
 }
 
@@ -950,6 +955,18 @@ body::before {
     height: 160px;
   }
 
+  .svg-gauge-val {
+    font-size: 1.8rem;
+  }
+
+  .svg-gauge-val span {
+    font-size: 0.9rem;
+  }
+
+  .svg-gauge-sub {
+    font-size: 0.75rem;
+  }
+
   .nav-tab-btn {
     font-size: 0.72rem;
     padding: 0.4rem 0.65rem;
@@ -983,11 +1000,93 @@ body::before {
   font-weight: 500;
 }
 
-/* =================== INVERTER TIMER =================== */
-.inverter-timer-display {
-  text-align: center;
-  padding: 1rem 0 0.75rem;
+/* =================== BAR CHART =================== */
+.bar-chart-container {
+  height: 180px;
+  margin: 1rem 0;
+  display: flex;
+  align-items: flex-end;
+  padding-bottom: 20px;
 }
+
+.bar-chart {
+  display: flex;
+  justify-content: space-around;
+  align-items: flex-end;
+  width: 100%;
+  height: 100%;
+  gap: 8px;
+}
+
+.bar-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: 1;
+  height: 100%;
+  position: relative;
+}
+
+.bar-fill-wrapper {
+  flex: 1;
+  width: 100%;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 6px;
+  position: relative;
+}
+
+.bar-fill {
+  width: 24px;
+  border-radius: 4px;
+  transition: height 0.5s ease-out;
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+
+.bar-fill.normal {
+  background: linear-gradient(to top, var(--accent-cyan), #818cf8);
+}
+
+.bar-fill.danger {
+  background: linear-gradient(to top, var(--accent-orange), var(--accent-red));
+}
+
+.bar-value {
+  position: absolute;
+  top: -20px;
+  font-size: 0.7rem;
+  color: var(--text-main);
+  font-family: var(--font-mono);
+}
+
+.bar-label {
+  margin-top: 8px;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.bar-event-badge {
+  position: absolute;
+  top: -10px;
+  right: -5px;
+  background: var(--accent-red);
+  color: #fff;
+  font-size: 0.65rem;
+  font-weight: bold;
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  z-index: 10;
+}
+
+/* =================== INVERTER TIMER =================== */
 
 .inverter-timer-value {
   font-family: var(--font-mono);
@@ -1078,4 +1177,196 @@ body::before {
   .inverter-timer-value {
     font-size: 1.5rem;
   }
+}
+
+/* =================== COMBINED CURRENT & POWER CHIPS =================== */
+.battery-metrics-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.battery-metric-chip {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-lg);
+  padding: 0.65rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  backdrop-filter: blur(12px);
+  transition: all 0.25s ease;
+}
+
+.battery-metric-chip:hover {
+  border-color: var(--border-hover);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.battery-metric-label {
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.battery-metric-val {
+  font-size: 1.35rem;
+  font-weight: 800;
+  font-family: var(--font-mono);
+  display: flex;
+  align-items: baseline;
+  gap: 0.2rem;
+}
+
+.battery-metric-val .unit {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.battery-metric-sub {
+  font-size: 0.68rem;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+/* =================== 4-CELL VOLTAGE BALANCE BAR CHART =================== */
+.cell-balance-card {
+  grid-column: span 2;
+  background: linear-gradient(135deg, rgba(15, 23, 42, 0.85), rgba(30, 41, 59, 0.5));
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-xl);
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  position: relative;
+  overflow: hidden;
+}
+
+.cell-balance-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.cell-balance-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.cell-balance-delta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.cell-bars-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+}
+
+@media (max-width: 768px) {
+  .cell-bars-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 480px) {
+  .cell-bars-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.cell-item {
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: var(--radius-lg);
+  padding: 1rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  transition: all 0.25s ease;
+  position: relative;
+}
+
+.cell-item:hover {
+  border-color: rgba(56, 189, 248, 0.3);
+  transform: translateY(-2px);
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+}
+
+.cell-top-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.cell-badge-num {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.cell-volt-val {
+  font-size: 1.45rem;
+  font-weight: 800;
+  font-family: var(--font-mono);
+  color: var(--text-main);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.cell-volt-val .unit {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-weight: 600;
+  margin-left: 0.15rem;
+}
+
+.cell-bar-track {
+  width: 100%;
+  height: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  position: relative;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.4);
+}
+
+.cell-bar-fill {
+  height: 100%;
+  border-radius: var(--radius-full);
+  transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1), background 0.5s ease;
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.3);
+}
+
+.cell-footer-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
 }
