@@ -806,8 +806,8 @@ void loop() {
     gridReturnTime = 0;
   }
 
-  // Power-cut timer: runs in PCUT and ECO+PCUT mode, but only when inverter is OFF
-  if (!isGrid && !inverterState && pcutMode) {
+  // Power-cut timer: runs in PCUT and ECO+PCUT mode only when inverter is OFF and battery has enough voltage (>= 12.5V) to start
+  if (!isGrid && !inverterState && pcutMode && (batVolt >= 12.5)) {
     if (!powerCutTimerActive) {
       powerCutTime = millis();
       powerCutTimerActive = true;
@@ -857,12 +857,16 @@ void loop() {
       } else {
         if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt >= 12.5) {
           inverterState = true;
+          powerCutTimerActive = false;
+          powerCutTime = 0;
         }
         if (batVolt <= 12.0) inverterState = false;
       }
     } else {
       if (gridReturnTimerActive && (millis() - gridReturnTime >= TIMER_DELAY_MS)) {
         inverterState = false;
+        gridReturnTimerActive = false;
+        gridReturnTime = 0;
       }
     }
   } 
@@ -875,11 +879,15 @@ void loop() {
     if (!isGrid) {
       if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt >= 12.5) {
         inverterState = true;
+        powerCutTimerActive = false;
+        powerCutTime = 0;
       }
       if (batVolt <= 12.0) inverterState = false; 
     } else {
       if (gridReturnTimerActive && (millis() - gridReturnTime >= TIMER_DELAY_MS)) {
         inverterState = false; 
+        gridReturnTimerActive = false;
+        gridReturnTime = 0;
       }
     }
   } 
@@ -1129,6 +1137,7 @@ void loop() {
         if (modeString == "POWER OFF") display.print(F("SYSTEM SHUTDOWN"));
         else if (modeString == "MANUAL") display.print(F("MANUAL OVERRIDE"));
         else if (!isGrid && batVolt <= 12.0) display.print(F("BATTERY CUTOFF"));
+        else if (!isGrid && !inverterState && batVolt < 12.5) display.print(F("LOW BAT (<12.5V)"));
         else display.print(F("SYSTEM NORMAL"));
       }
     }
