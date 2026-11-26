@@ -12,6 +12,15 @@ public:
     int cellCount = 4;
     bool dataValid = false;
     unsigned long lastUpdateTime = 0;
+    static const unsigned long BMS_TIMEOUT_MS = 10000;
+
+    void checkTimeout() {
+        if (dataValid && (millis() - lastUpdateTime > BMS_TIMEOUT_MS)) {
+            dataValid = false;
+            voltage = 0.0;
+            current = 0.0;
+        }
+    }
 
     void begin(HardwareSerial &serial, int rxPin, int txPin) {
         serial.begin(115200, SERIAL_8N1, rxPin, txPin);
@@ -69,10 +78,12 @@ public:
                         memmove(buffer, &buffer[i], remaining);
                         bufferIndex = remaining;
                     }
+                    checkTimeout();
                     return updated;
                 }
             }
         }
+        checkTimeout();
         return updated;
     }
 

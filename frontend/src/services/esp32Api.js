@@ -134,7 +134,8 @@ function getModeString(override) {
 
 async function sendAppHeartbeat() {
   const now = Date.now();
-  if (now - lastHeartbeatSent < 15000) return;
+  // Send renewal heartbeat at ~65s (right before ESP32's 90s active live-stream window sleeps)
+  if (now - lastHeartbeatSent < 65000) return;
   lastHeartbeatSent = now;
   try {
     await fetch(`${getBackendUrl()}/api/heartbeat`, {

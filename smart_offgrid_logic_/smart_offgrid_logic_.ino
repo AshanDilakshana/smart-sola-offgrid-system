@@ -21,6 +21,7 @@ unsigned long lastBmsRequest = 0;
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+bool oledFound = false;
 
 // RTC Setting
 RTC_DS3231 rtc;
@@ -94,7 +95,26 @@ bool normalChargingActive = false;
 bool topup530Done = false;         // Prevents evening top-up from looping
 bool topup1amDone = false;         // Prevents morning top-up from looping
 int statusPage = 0; 
-String currentModeString = "POWER OFF";
+
+// Dual-Core Thread-Safe Shared State (Core 0 MQTT/Network <-> Core 1 Control/OLED/I2C)
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+char currentModeBuf[20] = "POWER OFF";
+volatile unsigned long cachedEpoch = 0;
+
+void setCurrentModeSafe(const char* mode) {
+  portENTER_CRITICAL(&stateMux);
+  strncpy(currentModeBuf, mode, sizeof(currentModeBuf) - 1);
+  currentModeBuf[sizeof(currentModeBuf) - 1] = '\0';
+  portEXIT_CRITICAL(&stateMux);
+}
+
+void getCurrentModeSafe(char* out, size_t maxLen) {
+  if (maxLen == 0) return;
+  portENTER_CRITICAL(&stateMux);
+  strncpy(out, currentModeBuf, maxLen - 1);
+  out[maxLen - 1] = '\0';
+  portEXIT_CRITICAL(&stateMux);
+}
 
 // Web Control & Override Variables
 // webModeOverride: -1 = Auto (Physical Switches), 0 = POWER OFF, 1 = ECO MODE, 2 = POWER CUT, 3 = ECO+POWER CUT, 4 = MANUAL
@@ -136,13 +156,37 @@ void syncFirebaseTask(void * pvParameters);
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 
 unsigned long lastAppHeartbeatTime = 0;
-String lastReceivedHeartbeatStr = ""; // To track if the heartbeat timestamp actually changed
-const unsigned long ACTIVE_SESSION_TIMEOUT_MS = 10800000; // 3 Hours (10,800,000 ms)
+char lastReceivedHeartbeatBuf[32] = ""; // Tracks if heartbeat timestamp changed on Core 0
+const unsigned long ACTIVE_SESSION_TIMEOUT_MS = 90000UL; // 90s active live-stream window (renewed at ~65s right before sleep)
 bool isAppSessionActive = true;
 TaskHandle_t FirebaseTaskHandle;
 
 volatile bool forceImmediatePublish = false;
-String pendingOtaUrl = "";
+char pendingOtaUrlBuf[256] = "";
+volatile bool hasPendingOta = false;
+
+void setPendingOtaUrlSafe(const char* url) {
+  if (!url) return;
+  portENTER_CRITICAL(&stateMux);
+  strncpy(pendingOtaUrlBuf, url, sizeof(pendingOtaUrlBuf) - 1);
+  pendingOtaUrlBuf[sizeof(pendingOtaUrlBuf) - 1] = '\0';
+  hasPendingOta = (strlen(pendingOtaUrlBuf) > 10);
+  portEXIT_CRITICAL(&stateMux);
+}
+
+bool takePendingOtaUrlSafe(char* out, size_t maxLen) {
+  bool found = false;
+  portENTER_CRITICAL(&stateMux);
+  if (hasPendingOta && maxLen > 0) {
+    strncpy(out, pendingOtaUrlBuf, maxLen - 1);
+    out[maxLen - 1] = '\0';
+    pendingOtaUrlBuf[0] = '\0';
+    hasPendingOta = false;
+    found = true;
+  }
+  portEXIT_CRITICAL(&stateMux);
+  return found;
+}
 
 // --- 15-Minute Periodic History Logging & Offline Ring Buffer ---
 unsigned long lastHistoryLogTime = 0;
@@ -166,17 +210,10 @@ OfflineHistoryRecord offlineHistoryBuffer[MAX_OFFLINE_HISTORY];
 int offlineHistoryHead = 0;
 int offlineHistoryCount = 0;
 
-// Helper to get current Unix Epoch (NTP when online, RTC DS3231 fallback when offline)
+// Thread-safe Unix Epoch getter (Core 1 updates cachedEpoch from NTP/RTC; Core 0 reads without I2C/UDP collision)
 unsigned long getCurrentEpoch() {
-  if (WiFi.status() == WL_CONNECTED) {
-    unsigned long ntpEpoch = timeClient.getEpochTime();
-    if (ntpEpoch > 1700000000UL) return ntpEpoch;
-  }
-  if (rtcFound) {
-    DateTime now = rtc.now();
-    unsigned long rtcEpoch = now.unixtime();
-    if (rtcEpoch > 1700000000UL) return rtcEpoch;
-  }
+  unsigned long ep = cachedEpoch;
+  if (ep > 1700000000UL) return ep;
   return millis() / 1000;
 }
 
@@ -200,12 +237,14 @@ void enqueueOfflineHistory() {
   rec.gridPresent = debouncedGridState;
   rec.inverterState = inverterState;
   rec.smpsState = smpsState;
-  strncpy(rec.mode, currentModeString.c_str(), sizeof(rec.mode) - 1);
-  rec.mode[sizeof(rec.mode) - 1] = '\0';
+  getCurrentModeSafe(rec.mode, sizeof(rec.mode));
 }
 
 // Helper to build status JSON payload
 String buildStatusJson() {
+  char modeSnap[20];
+  getCurrentModeSafe(modeSnap, sizeof(modeSnap));
+
   String json = "{";
   json += "\"epoch\":" + String(getCurrentEpoch()) + ",";
   json += "\"batteryVoltage\":" + String(lastBatVolt, 2) + ",";
@@ -216,7 +255,7 @@ String buildStatusJson() {
   json += "\"gridPresent\":" + String(debouncedGridState ? "true" : "false") + ",";
   json += "\"inverterState\":" + String(inverterState ? "true" : "false") + ",";
   json += "\"smpsState\":" + String(smpsState ? "true" : "false") + ",";
-  json += "\"modeString\":\"" + currentModeString + "\",";
+  json += "\"modeString\":\"" + String(modeSnap) + "\",";
   json += "\"webModeOverride\":" + String(webModeOverride) + ",";
   json += "\"forceChargingActive\":" + String(forceChargingActive ? "true" : "false") + ",";
   json += "\"topup530Active\":" + String(topup530Active ? "true" : "false") + ",";
@@ -254,13 +293,15 @@ void setup() {
   pinMode(PCUT_SWITCH, INPUT_PULLUP);
   pinMode(MANUAL_SWITCH, INPUT_PULLUP);
 
-  // Initialize OLED
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
-    Serial.println(F("SSD1306 allocation failed"));
-    for(;;);
+  // Initialize OLED (Non-blocking: system continues autonomously even if OLED wire is loose)
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed - continuing without OLED"));
+    oledFound = false;
+  } else {
+    oledFound = true;
+    display.clearDisplay();
+    display.display();
   }
-  display.clearDisplay();
-  display.display();
 
   // Initialize RTC
   if (!rtc.begin()) {
@@ -268,6 +309,10 @@ void setup() {
     rtcFound = false;
   } else {
     rtcFound = true;
+    DateTime now = rtc.now();
+    if (now.unixtime() > 1700000000UL) {
+      cachedEpoch = now.unixtime();
+    }
   }
 
   // Initialize debounced grid state to avoid 1-second false power-cut at boot
@@ -297,7 +342,7 @@ void setup() {
   }
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(1024); // Ensure 1KB buffer for full JSON telemetry
-  mqttClient.setKeepAlive(15);
+  mqttClient.setKeepAlive(60);    // 60s MQTT keep-alive (4x lower ping rate for free-tier limits)
   mqttClient.setSocketTimeout(3);
 
   // Configure Local Web Server & CORS (Works on Local Wi-Fi even if Internet is down)
@@ -331,9 +376,12 @@ void setup() {
 // 🛠️ NOISE FILTERED VOLTAGE FUNCTIONS
 // ---------------------------------------------------------
 float getBatteryVoltage() {
-  // Return the voltage parsed from the JK BMS
+  // Check 10s BMS timeout so a disconnected BMS UART wire triggers BAT WIRE FAULT
+  jkbms.checkTimeout();
   if (jkbms.dataValid) {
     lastBatVolt = jkbms.voltage;
+  } else {
+    lastBatVolt = 0.0;
   }
   return lastBatVolt;
 }
@@ -410,7 +458,7 @@ void handleOTAUpdate() {
   }
   String firmwareUrl = server.arg("url");
   server.send(200, "application/json", "{\"success\":true,\"message\":\"Starting OTA update from GitHub...\"}");
-  pendingOtaUrl = firmwareUrl;
+  setPendingOtaUrlSafe(firmwareUrl.c_str());
 }
 
 // ---------------------------------------------------------
@@ -465,8 +513,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (commaIdx == -1) commaIdx = msg.indexOf("}", hbIdx);
     if (commaIdx != -1) {
       String hbValue = msg.substring(hbIdx + 16, commaIdx);
-      if (hbValue != lastReceivedHeartbeatStr) {
-        lastReceivedHeartbeatStr = hbValue;
+      if (hbValue != String(lastReceivedHeartbeatBuf)) {
+        strncpy(lastReceivedHeartbeatBuf, hbValue.c_str(), sizeof(lastReceivedHeartbeatBuf) - 1);
+        lastReceivedHeartbeatBuf[sizeof(lastReceivedHeartbeatBuf) - 1] = '\0';
         lastAppHeartbeatTime = millis();
         isAppSessionActive = true;
       }
@@ -480,7 +529,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (endOta != -1) {
       String otaUrl = msg.substring(otaIdx + 10, endOta);
       if (otaUrl.length() > 10) {
-        pendingOtaUrl = otaUrl;
+        setPendingOtaUrlSafe(otaUrl.c_str());
       }
     }
   }
@@ -518,9 +567,9 @@ void syncFirebaseTask(void * pvParameters) {
     }
 
     // 3. Handle Pending OTA Firmware Update (Only when triggered)
-    if (pendingOtaUrl.length() > 10) {
-      String urlToFlash = pendingOtaUrl;
-      pendingOtaUrl = "";
+    char otaUrlBuf[256];
+    if (takePendingOtaUrlSafe(otaUrlBuf, sizeof(otaUrlBuf))) {
+      String urlToFlash = String(otaUrlBuf);
       Serial.println("Starting OTA Update from: " + urlToFlash);
 
       WiFiClientSecure otaClient;
@@ -572,12 +621,25 @@ void syncFirebaseTask(void * pvParameters) {
       // Process incoming MQTT packets instantly
       mqttClient.loop();
 
-      // 5. Evaluate 3-Hour App Heartbeat Session Timeout
+      // 5. Evaluate 90-Second Active Dashboard Session Timeout (renewed at ~65s right before sleep)
       if (lastAppHeartbeatTime == 0) lastAppHeartbeatTime = now;
       isAppSessionActive = ((now - lastAppHeartbeatTime) < ACTIVE_SESSION_TIMEOUT_MS);
 
-      // 6. Publish Live Telemetry every 2 seconds (or immediately upon command execution)
-      if (forceImmediatePublish || (isAppSessionActive && (now - lastStatusPublish >= 2000))) {
+      // 6. Rate-Limit-Friendly Adaptive MQTT Telemetry:
+      //    - Active dashboard open: 2s live updates
+      //    - Background / Discharging (Inverter ON or load current > 0.05A): every 2 min (120,000 ms)
+      //    - Background / Charging (SMPS ON or charge current < -0.05A): every 5 min (300,000 ms)
+      //    - Background / Idle Standby: every 15 min (900,000 ms)
+      unsigned long publishIntervalMs = 900000UL;
+      if (isAppSessionActive) {
+        publishIntervalMs = 2000UL;
+      } else if (inverterState || jkbms.current > 0.05f) {
+        publishIntervalMs = 120000UL;
+      } else if (smpsState || jkbms.current < -0.05f) {
+        publishIntervalMs = 300000UL;
+      }
+
+      if (forceImmediatePublish || (now - lastStatusPublish >= publishIntervalMs)) {
         forceImmediatePublish = false;
         lastStatusPublish = now;
         String statusPayload = buildStatusJson();
@@ -637,9 +699,12 @@ void loop() {
     displayTime = timeClient.getFormattedTime().substring(0, 5);
     currentHour = timeClient.getHours(); 
     currentMinute = timeClient.getMinutes(); 
+    unsigned long epoch = timeClient.getEpochTime();
+    if (epoch > 1700000000UL) {
+      cachedEpoch = epoch;
+    }
     static unsigned long lastRtcSync = 0;
     if (rtcFound && (millis() - lastRtcSync >= 3600000 || lastRtcSync == 0)) {
-      unsigned long epoch = timeClient.getEpochTime();
       if (epoch > 1767225600) { 
         rtc.adjust(DateTime(epoch)); 
         lastRtcSync = millis();
@@ -647,6 +712,9 @@ void loop() {
     }
   } else if (rtcFound) {
     DateTime now = rtc.now();
+    if (now.unixtime() > 1700000000UL) {
+      cachedEpoch = now.unixtime();
+    }
     char buf[] = "hh:mm";
     displayTime = String(now.toString(buf));
     currentHour = now.hour(); 
@@ -821,9 +889,10 @@ void loop() {
   }
 
   // ---------------------------------------------------------
-  // ⚡ SMPS EXTRA CHARGER LOGIC (WITH PREVENT LOOPING & GRID DEBOUNCE)
+  // ⚡ SMPS EXTRA CHARGER LOGIC (STRICT INVERTER-OFF INTERLOCK IN ALL MODES)
   // ---------------------------------------------------------
-  bool allowCharging = (errorString == "") /* && isGrid */ && !inverterState && !manualMode && (ecoMode || pcutMode || modeString == "POWER OFF");
+  // Automatic charging is allowed in ANY non-manual mode ONLY when Inverter is OFF and no battery fault exists
+  bool allowAutoCharging = (errorString == "") && !inverterState && !manualMode;
 
   // Reset top-up Done flags when we are outside the respective time windows
   if (currentHour != 17) {
@@ -833,13 +902,17 @@ void loop() {
     topup1amDone = false;
   }
 
-  // Auto safety cutoff for force charging if fault exists or battery reaches stop threshold
-  if (forceChargingActive && (errorString != "" || inverterState || batVolt >= BAT_CHARGE_STOP_THRESHOLD)) {
+  // Strict Hardware Interlock: if Inverter is ON, fault exists, or battery reached 15.5V stop threshold, cut off charging
+  if (inverterState || errorString != "" || batVolt >= BAT_CHARGE_STOP_THRESHOLD) {
     forceChargingActive = false;
+    manualSmpsOverride = false;
   }
 
-  // --- Flatline Detection Logic (Runs for all charging modes including Force Charge) ---
-  if ((errorString == "") && (forceChargingActive || topup530Active || topup1amActive || normalChargingActive)) {
+  // --- Flatline Detection Logic (Runs for all active charging requests while Inverter is OFF) ---
+  bool anyChargingRequest = !inverterState && (errorString == "") && (
+    forceChargingActive || (manualMode && manualSmpsOverride) || topup530Active || topup1amActive || normalChargingActive
+  );
+  if (anyChargingRequest) {
     if (batVolt >= DVDT_START_VOLTAGE) {
       if (lastRecordedVoltage == 0.0) {
         lastRecordedVoltage = batVolt;
@@ -863,14 +936,33 @@ void loop() {
     flatlineDetected = false;
   }
 
-  if (forceChargingActive) {
+  if (inverterState || errorString != "") {
+    // Hardware Interlock: SMPS Charger MUST remain OFF whenever Inverter is ON (in ANY mode)
+    topup530Active = false;
+    topup1amActive = false;
+    normalChargingActive = false;
+    forceChargingActive = false;
+    manualSmpsOverride = false;
+    smpsState = false;
+  }
+  else if (forceChargingActive) {
     smpsState = true;
     if (batVolt >= BAT_CHARGE_STOP_THRESHOLD || flatlineDetected) {
       forceChargingActive = false;
       smpsState = false;
     }
   }
-  else if (allowCharging) {
+  else if (manualMode) {
+    topup530Active = false;
+    topup1amActive = false;
+    normalChargingActive = false;
+    smpsState = manualSmpsOverride;
+    if (smpsState && (batVolt >= BAT_CHARGE_STOP_THRESHOLD || flatlineDetected)) {
+      manualSmpsOverride = false;
+      smpsState = false;
+    }
+  }
+  else if (allowAutoCharging) {
     
     // 1. Mandatory 5:30 PM top-up charge (Evening Prep Logic)
     if ((currentHour == 17 && currentMinute >= 30) && batVolt < BAT_TOPUP_START_THRESHOLD && !topup530Done && !topup1amActive && !normalChargingActive) {
@@ -882,7 +974,7 @@ void loop() {
       topup1amActive = true;
     }
     
-    // 3. Charge when battery level drops below normal threshold (Anytime)
+    // 3. Charge when battery level drops below normal threshold (Anytime Inverter is OFF)
     if (batVolt <= BAT_CHARGE_START_THRESHOLD && !topup530Active && !topup1amActive) {
       normalChargingActive = true;
     }
@@ -940,89 +1032,108 @@ void loop() {
     }
   }
 
-  currentModeString = modeString;
+  setCurrentModeSafe(modeString.c_str());
 
-  // ---------------------------------------------------------
-  // OLED DISPLAY GRAPHICS LAYOUT
-  // ---------------------------------------------------------
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-
-  drawWiFiBars(2, 1);
-
-  display.setCursor(48, 1);
-  if (errorString == "BAT WIRE FAULT") {
-    display.print(F("--.-V"));
-  } else {
-    display.print(batVolt, 1);
-    display.print(F("V"));
+  // Wake MQTT immediately on any relay or grid transition even during 15-min idle sleep
+  static bool prevPublishedInv = false;
+  static bool prevPublishedSmps = false;
+  static bool prevPublishedGrid = false;
+  static bool transitionTrackInit = false;
+  if (!transitionTrackInit) {
+    prevPublishedInv = inverterState;
+    prevPublishedSmps = smpsState;
+    prevPublishedGrid = isGrid;
+    transitionTrackInit = true;
+  } else if (prevPublishedInv != inverterState || prevPublishedSmps != smpsState || prevPublishedGrid != isGrid) {
+    prevPublishedInv = inverterState;
+    prevPublishedSmps = smpsState;
+    prevPublishedGrid = isGrid;
+    forceImmediatePublish = true;
   }
 
-  display.setCursor(95, 1);
-  display.print(displayTime);
-  
-  display.drawFastHLine(0, 11, 128, SSD1306_WHITE);
+  // ---------------------------------------------------------
+  // OLED DISPLAY GRAPHICS LAYOUT (Skipped safely if OLED is disconnected)
+  // ---------------------------------------------------------
+  if (oledFound) {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
 
-  display.setCursor(0, 20);
-  if (countdownSecs >= 0) {
-    display.setTextSize(2); 
-    display.print(countdownSecs);
-    display.print(F("s WAIT"));
-  } 
-  else {
-    if (modeString == "ECO+POWER CUT") {
-      display.setTextSize(1); 
-      display.setCursor(0, 24);
+    drawWiFiBars(2, 1);
+
+    display.setCursor(48, 1);
+    if (errorString == "BAT WIRE FAULT") {
+      display.print(F("--.-V"));
     } else {
-      display.setTextSize(2);
+      display.print(batVolt, 1);
+      display.print(F("V"));
     }
-    display.print(modeString);
-  }
 
-  display.drawFastHLine(0, 42, 128, SSD1306_WHITE);
+    display.setCursor(95, 1);
+    display.print(displayTime);
+    
+    display.drawFastHLine(0, 11, 128, SSD1306_WHITE);
 
-  display.setTextSize(1);
-  display.setCursor(0, 50);
-  
-  if (modeString == "ERROR") {
-    display.print(F("Fault: "));
-    display.print(errorString);
-  } 
-  else if (countdownSecs >= 0) {
-    if (countdownType == "PWR_CUT") {
-      display.print(F("Grid DOWN -> INV ON"));
-    } else if (countdownType == "GRID_RET") {
-      display.print(F("Grid OK -> INV OFF"));
-    }
-  }
-  else {
-    if (statusPage == 0) {
-      display.print(F("Relay: "));
-      if (inverterState) display.print(F("INVERTER ON"));
-      else if (smpsState) display.print(F("SMPS CHARGING"));
-      else display.print(F("ALL RELAYS OFF"));
+    display.setCursor(0, 20);
+    if (countdownSecs >= 0) {
+      display.setTextSize(2); 
+      display.print(countdownSecs);
+      display.print(F("s WAIT"));
     } 
-    else if (statusPage == 1) {
-      display.print(F("Grid:"));
-      display.print(isGrid ? F("OK") : F("DOWN"));
-      display.print(F(" | Sun:"));
-      if (solVolt > 5.0) {
-        display.print(solVolt, 1);
-        display.print("V");
+    else {
+      if (modeString == "ECO+POWER CUT") {
+        display.setTextSize(1); 
+        display.setCursor(0, 24);
       } else {
-        display.print("NO");
+        display.setTextSize(2);
       }
-    } 
-    else if (statusPage == 2) {
-      display.print(F("Status: "));
-      if (modeString == "POWER OFF") display.print(F("SYSTEM SHUTDOWN"));
-      else if (modeString == "MANUAL") display.print(F("MANUAL OVERRIDE"));
-      else if (!isGrid && batVolt <= 12.0) display.print(F("BATTERY CUTOFF"));
-      else display.print(F("SYSTEM NORMAL"));
+      display.print(modeString);
     }
-  }
 
-  display.display();
+    display.drawFastHLine(0, 42, 128, SSD1306_WHITE);
+
+    display.setTextSize(1);
+    display.setCursor(0, 50);
+    
+    if (modeString == "ERROR") {
+      display.print(F("Fault: "));
+      display.print(errorString);
+    } 
+    else if (countdownSecs >= 0) {
+      if (countdownType == "PWR_CUT") {
+        display.print(F("Grid DOWN -> INV ON"));
+      } else if (countdownType == "GRID_RET") {
+        display.print(F("Grid OK -> INV OFF"));
+      }
+    }
+    else {
+      if (statusPage == 0) {
+        display.print(F("Relay: "));
+        if (inverterState) display.print(F("INVERTER ON"));
+        else if (smpsState) display.print(F("SMPS CHARGING"));
+        else display.print(F("ALL RELAYS OFF"));
+      } 
+      else if (statusPage == 1) {
+        display.print(F("Grid:"));
+        display.print(isGrid ? F("OK") : F("DOWN"));
+        display.print(F(" | Sun:"));
+        if (solVolt > 5.0) {
+          display.print(solVolt, 1);
+          display.print("V");
+        } else {
+          display.print("NO");
+        }
+      } 
+      else if (statusPage == 2) {
+        display.print(F("Status: "));
+        if (modeString == "POWER OFF") display.print(F("SYSTEM SHUTDOWN"));
+        else if (modeString == "MANUAL") display.print(F("MANUAL OVERRIDE"));
+        else if (!isGrid && batVolt <= 12.0) display.print(F("BATTERY CUTOFF"));
+        else display.print(F("SYSTEM NORMAL"));
+      }
+    }
+
+    display.display();
+  }
   delay(200); 
 }

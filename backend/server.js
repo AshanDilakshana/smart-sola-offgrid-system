@@ -624,13 +624,14 @@ function publishCommandToEsp32(cmdPatch) {
   }
 }
 
-// Mark device offline if no status received for > 15 seconds
+// Mark device offline if no status received for > 16 minutes (allows 15-min idle sleep mode)
+const DEVICE_OFFLINE_TIMEOUT_MS = 16 * 60 * 1000;
 setInterval(() => {
-  if (deviceOnline && lastSeenTimestamp > 0 && Date.now() - lastSeenTimestamp > 15000) {
+  if (deviceOnline && lastSeenTimestamp > 0 && Date.now() - lastSeenTimestamp > DEVICE_OFFLINE_TIMEOUT_MS) {
     deviceOnline = false;
     broadcastSSE('availability', { deviceOnline: false, lastSeen: lastSeenTimestamp });
   }
-}, 5000);
+}, 15000);
 
 // ---------------------------------------------------------
 // Express REST & SSE Endpoints
@@ -661,9 +662,9 @@ app.get('/api/stream', (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
 
-  // Wake up ESP32 3-hour active session timer when a dashboard connects
+  // Wake up ESP32 90s active live-stream window when a dashboard connects (throttled to 60s)
   const now = Date.now();
-  if (now - lastHeartbeatForwardedAt > 20000) {
+  if (now - lastHeartbeatForwardedAt > 60000) {
     lastHeartbeatForwardedAt = now;
     publishCommandToEsp32({ lastHeartbeat: now }, false);
   }
@@ -692,9 +693,9 @@ app.get('/api/stream', (req, res) => {
 
 // Get System Status (REST endpoint compatible with esp32Api.js)
 app.get('/api/status', (req, res) => {
-  // Forward app heartbeat to ESP32 every 25s while dashboard is polling/viewing
+  // Renew ESP32 90s active live-stream window at most once per 60s (right before sleep)
   const now = Date.now();
-  if (now - lastHeartbeatForwardedAt > 25000) {
+  if (now - lastHeartbeatForwardedAt > 60000) {
     lastHeartbeatForwardedAt = now;
     publishCommandToEsp32({ lastHeartbeat: now }, false);
   }
@@ -715,14 +716,14 @@ app.get('/api/status', (req, res) => {
     mqttConnected,
     mongoConnected,
     lastSeen: lastSeenTimestamp,
-    isConnected: deviceOnline || (now - lastSeenTimestamp < 30000)
+    isConnected: deviceOnline || (now - lastSeenTimestamp < DEVICE_OFFLINE_TIMEOUT_MS)
   });
 });
 
-// Heartbeat Endpoint
+// Heartbeat Endpoint (renews ESP32 active window right before 90s sleep timeout)
 app.post('/api/heartbeat', (req, res) => {
   const now = Date.now();
-  if (now - lastHeartbeatForwardedAt > 15000) {
+  if (now - lastHeartbeatForwardedAt > 60000) {
     lastHeartbeatForwardedAt = now;
     publishCommandToEsp32({ lastHeartbeat: now }, false);
   }
