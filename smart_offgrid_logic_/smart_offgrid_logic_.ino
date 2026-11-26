@@ -248,8 +248,8 @@ void setup() {
   pinMode(INV_RELAY, OUTPUT);
   pinMode(SMPS_RELAY, OUTPUT);
 
-  // Sensing and Switch Pins
-  pinMode(GRID_SENS, INPUT);
+  // Sensing and Switch Pins (INPUT_PULLDOWN prevents floating HIGH when optocoupler turns off)
+  pinMode(GRID_SENS, INPUT_PULLDOWN);
   pinMode(ECO_SWITCH, INPUT_PULLUP);
   pinMode(PCUT_SWITCH, INPUT_PULLUP);
   pinMode(MANUAL_SWITCH, INPUT_PULLUP);
