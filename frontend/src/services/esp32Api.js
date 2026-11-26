@@ -5,7 +5,7 @@ const DEFAULT_BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'https://smart-s
 export function getBackendUrl() {
   if (typeof window !== 'undefined') {
     const saved = localStorage.getItem('smart_offgrid_backend_url');
-    if (saved && saved !== 'http://localhost:5000') return saved;
+    if (saved && saved.trim()) return saved.trim().replace(/\/+$/, '');
   }
   return DEFAULT_BACKEND_URL;
 }
@@ -54,6 +54,14 @@ let sseSource = null;
 let latestSseStatus = null;
 let lastSseReceivedAt = 0;
 let lastHeartbeatSent = 0;
+const cloudEventListeners = new Set();
+
+export function subscribeCloudEvents(listener) {
+  cloudEventListeners.add(listener);
+  return () => {
+    cloudEventListeners.delete(listener);
+  };
+}
 
 function ensureSseStream() {
   if (sseSource || typeof window === 'undefined' || typeof EventSource === 'undefined') return;
@@ -73,6 +81,19 @@ function ensureSseStream() {
             isConnected: true
           };
           lastSseReceivedAt = Date.now();
+        }
+      } catch (err) {}
+    });
+
+    sseSource.addEventListener('event', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data && data.event) {
+          for (const listener of cloudEventListeners) {
+            try {
+              listener(data);
+            } catch (_) {}
+          }
         }
       } catch (err) {}
     });
@@ -333,53 +354,147 @@ export async function triggerOtaUpdate(esp32Ip, connectionMode, firmwareUrl) {
   return { success: true, message: 'OTA Update command issued' };
 }
 
-export async function fetchHistory(connectionMode) {
-  if (connectionMode === 'cloud') {
-    try {
-      const res = await fetch(`${getBackendUrl()}/api/history?days=7`);
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data) && data.length > 0) {
-          return data.sort((a, b) => a.epoch - b.epoch);
-        }
-      }
-    } catch (err) {
-      console.warn('MongoDB Backend history fetch failed:', err.message);
-    }
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
   }
-
-  // Standalone mode mock data generator if MongoDB has no records yet
-  const mockHistory = [];
-  const now = Math.floor(Date.now() / 1000);
-  const intervals = 7 * 24 * 4;
-
-  for (let i = intervals; i >= 0; i--) {
-    const epoch = now - (i * 900);
-    const hour = new Date(epoch * 1000).getHours();
-    const isDay = hour >= 7 && hour <= 17;
-    const isManualEvent = Math.random() > 0.95;
-
-    mockHistory.push({
-      epoch: epoch,
-      batteryVoltage: isManualEvent ? 12.4 : (isDay ? 14.1 : 12.8),
-      inverterState: isManualEvent ? true : Math.random() > 0.3,
-      mode: isManualEvent ? 'MANUAL' : 'ECO MODE',
-      batterySoc: isDay ? 90 : 50,
-      gridPresent: false
-    });
-  }
-
-  return mockHistory;
 }
 
-export async function fetchCloudEvents(connectionMode = 'cloud') {
+export async function fetchHistory(connectionMode, days = 7, maxPoints = 480) {
   if (connectionMode !== 'cloud') return [];
   try {
-    const res = await fetch(`${getBackendUrl()}/api/events`);
+    const res = await fetchWithTimeout(
+      `${getBackendUrl()}/api/history?days=${days}&maxPoints=${maxPoints}`,
+      {},
+      8000
+    );
+    if (res.ok) {
+      const data = await res.json();
+      return Array.isArray(data) ? data.sort((a, b) => a.epoch - b.epoch) : [];
+    }
+  } catch (err) {
+    console.warn('MongoDB Backend history fetch failed:', err.message);
+  }
+  return [];
+}
+
+function computeClientDailyUptime(rows, days = 7) {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const sorted = [...rows].sort((a, b) => a.epoch - b.epoch);
+  const dailyMap = new Map();
+  let inDeepDischarge = false;
+
+  for (let i = 0; i < sorted.length; i++) {
+    const curr = sorted[i];
+    const dateObj = new Date(curr.epoch * 1000);
+    const y = dateObj.getFullYear();
+    const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+    const d = String(dateObj.getDate()).padStart(2, '0');
+    const dateKey = `${y}-${m}-${d}`;
+    const dateStr = dateObj.toLocaleDateString();
+    const shortDay = dateObj.toLocaleDateString('en-US', { weekday: 'short' });
+
+    if (!dailyMap.has(dateKey)) {
+      dailyMap.set(dateKey, {
+        dateKey,
+        dateStr,
+        shortDay,
+        uptimeSec: 0,
+        deepDischargeCount: 0,
+        minVoltage: Number(curr.batteryVoltage),
+        maxVoltage: Number(curr.batteryVoltage)
+      });
+    }
+
+    const bucket = dailyMap.get(dateKey);
+    const v = Number(curr.batteryVoltage ?? 0);
+    if (v > 1) {
+      bucket.minVoltage = Math.min(bucket.minVoltage, v);
+      bucket.maxVoltage = Math.max(bucket.maxVoltage, v);
+    }
+
+    const dtSec = i < sorted.length - 1
+      ? Math.min(Math.max(Number(sorted[i + 1].epoch) - Number(curr.epoch), 0), 30 * 60)
+      : (curr.inverterState || curr.phase === 'discharging' ? 120 : 900);
+
+    if (curr.inverterState) {
+      bucket.uptimeSec += dtSec;
+    }
+
+    const isDeep = Boolean(curr.inverterState)
+      && (curr.mode === 'MANUAL' || curr.modeString === 'MANUAL')
+      && v > 1
+      && v <= 12.5;
+    if (isDeep && !inDeepDischarge) {
+      bucket.deepDischargeCount += 1;
+    }
+    inDeepDischarge = isDeep;
+  }
+
+  return Array.from(dailyMap.values())
+    .sort((a, b) => a.dateKey.localeCompare(b.dateKey))
+    .slice(-days)
+    .map(({ uptimeSec, minVoltage, maxVoltage, ...rest }) => ({
+      ...rest,
+      uptimeHours: Number((uptimeSec / 3600).toFixed(2)),
+      minVoltage: Number.isFinite(minVoltage) ? Number(minVoltage.toFixed(2)) : null,
+      maxVoltage: Number.isFinite(maxVoltage) ? Number(maxVoltage.toFixed(2)) : null
+    }));
+}
+
+export async function fetchDailyUptime(connectionMode = 'cloud', days = 7) {
+  if (connectionMode !== 'cloud') return [];
+  const tzOffsetMin = new Date().getTimezoneOffset();
+  try {
+    const res = await fetchWithTimeout(
+      `${getBackendUrl()}/api/history/daily?days=${days}&tzOffsetMin=${tzOffsetMin}`,
+      {},
+      8000
+    );
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data)) return data;
+    }
+    // Fallback if hosted server hasn't deployed /api/history/daily yet
+    const rows = await fetchHistory(connectionMode, days, 2000);
+    return computeClientDailyUptime(rows, days);
+  } catch (err) {
+    console.warn('MongoDB Backend daily uptime fetch failed:', err.message);
+    return [];
+  }
+}
+
+export async function fetchCloudEvents(connectionMode = 'cloud', limit = 150) {
+  if (connectionMode !== 'cloud') return [];
+  try {
+    const res = await fetchWithTimeout(
+      `${getBackendUrl()}/api/events?days=60&limit=${limit}`,
+      {},
+      8000
+    );
     if (res.ok) {
       const data = await res.json();
       return Array.isArray(data) ? data : [];
     }
   } catch (err) {}
   return [];
+}
+
+export async function saveCloudEvent(connectionMode = 'cloud', eventText, type = 'info', details = {}) {
+  if (connectionMode !== 'cloud' || !eventText) return;
+  try {
+    await fetchWithTimeout(
+      `${getBackendUrl()}/api/events`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: eventText, type, details })
+      },
+      5000
+    );
+  } catch (err) {}
 }

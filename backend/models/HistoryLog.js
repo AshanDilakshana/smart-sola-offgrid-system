@@ -51,11 +51,28 @@ const historyLogSchema = new mongoose.Schema(
     syncedFromOfflineBuffer: {
       type: Boolean,
       default: false
+    },
+    phase: {
+      type: String,
+      enum: ['charging', 'discharging', 'idle'],
+      default: 'idle'
+    },
+    source: {
+      type: String,
+      enum: ['esp32', 'offline-buffer', 'sample-seed'],
+      default: 'esp32',
+      index: true
+    },
+    recordedAt: {
+      type: Date,
+      default: Date.now
     }
   },
   {
     timestamps: true
   }
 );
+
+historyLogSchema.index({ recordedAt: 1 }, { expireAfterSeconds: 60 * 24 * 60 * 60 });
 
 export const HistoryLog = mongoose.model('HistoryLog', historyLogSchema);

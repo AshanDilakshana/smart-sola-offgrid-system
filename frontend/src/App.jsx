@@ -1,40 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import {
-  Zap,
-  Sun,
-  Battery,
-  Wifi,
-  WifiOff,
-  Power,
-  Clock,
-  Sliders,
-  ShieldAlert,
-  Activity,
-  RefreshCw,
-  Radio,
-  FileText,
-  SlidersHorizontal,
-  ChevronRight,
-  TrendingDown,
-  Clock3,
-  CloudLightning,
-  PlugZap,
-  BatteryCharging,
-  Signal,
-  Timer,
-  AlertTriangle,
-  ToggleLeft,
-  ToggleRight,
-  Database,
-  Server,
-  Cpu,
-  CheckCircle2,
-  ArrowRight,
-  Gauge,
-  Download,
-  Smartphone,
-  X
-} from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { LayoutDashboard, Sliders, Clock, CloudLightning, ScrollText, ShieldAlert, AlertTriangle, Smartphone, X, FlaskConical } from 'lucide-react';
 import {
   fetchSystemStatus,
   setSystemMode,
@@ -42,10 +7,176 @@ import {
   controlManualRelay,
   triggerOtaUpdate,
   fetchHistory,
+  fetchDailyUptime,
   fetchCloudEvents,
+  saveCloudEvent,
+  subscribeCloudEvents,
   getBackendUrl,
   setBackendUrl
 } from './services/esp32Api';
+import { getFlowDirection, packSocFromVoltage, CELL_COUNT } from './utils/battery';
+import Header from './components/Header';
+import OverviewTab from './components/tabs/OverviewTab';
+import ControlsTab, { MODES } from './components/tabs/ControlsTab';
+import TimersTab from './components/tabs/TimersTab';
+import SettingsTab from './components/tabs/SettingsTab';
+import LogsTab from './components/tabs/LogsTab';
+import { ConfirmDialog, ToastStack } from './components/Overlays';
+
+const TABS = [
+  { id: 'overview', label: 'Overview', mobileLabel: 'Overview', icon: <LayoutDashboard size={16} /> },
+  { id: 'controls', label: 'Controls', mobileLabel: 'Controls', icon: <Sliders size={16} /> },
+  { id: 'timers', label: 'Timers & Logic', mobileLabel: 'Timers', icon: <Clock size={16} /> },
+  { id: 'settings', label: 'Cloud & OTA', mobileLabel: 'Cloud', icon: <CloudLightning size={16} /> },
+  { id: 'logs', label: 'Event Logs', mobileLabel: 'Logs', icon: <ScrollText size={16} /> },
+];
+
+const HISTORY_LEN = 60;
+
+const DEMO_SCENARIOS = [
+  { id: 'charging', label: 'Charging' },
+  { id: 'discharging', label: 'Discharging' },
+  { id: 'balancing', label: 'Imbalanced' },
+  { id: 'float', label: 'Float' },
+];
+
+function buildDemoFrame(scenario, step) {
+  let baseCells = [3.362, 3.356, 3.359, 3.351];
+  let drift = 0;
+  let batteryCurrent = -12.2;
+  let smpsState = true;
+  let gridPresent = true;
+  let inverterState = false;
+  let flatlineDetected = false;
+  let modeString = 'ECO MODE';
+  let webModeOverride = 1;
+  let batterySoc = 76;
+
+  if (scenario === 'charging') {
+    drift = (step % 45) * 0.00035;
+    baseCells = [3.362, 3.356, 3.359, 3.351];
+    batteryCurrent = Number((-12.2 + Math.sin(step * 0.5) * 0.35).toFixed(2));
+    batterySoc = Math.min(99, 74 + Math.floor((step % 45) / 10));
+  } else if (scenario === 'discharging') {
+    drift = -((step % 45) * 0.00035);
+    baseCells = [3.286, 3.279, 3.284, 3.274];
+    batteryCurrent = Number((14.3 + Math.sin(step * 0.5) * 0.75).toFixed(2));
+    smpsState = false;
+    gridPresent = false;
+    inverterState = true;
+    modeString = 'POWER CUT';
+    webModeOverride = 2;
+    batterySoc = Math.max(52, 64 - Math.floor((step % 45) / 10));
+  } else if (scenario === 'balancing') {
+    drift = (step % 30) * 0.00015;
+    baseCells = [3.524, 3.468, 3.492, 3.455];
+    batteryCurrent = Number((-4.2 + Math.sin(step * 0.4) * 0.25).toFixed(2));
+    batterySoc = 92;
+  } else {
+    baseCells = [3.421, 3.420, 3.419, 3.421];
+    batteryCurrent = 0;
+    flatlineDetected = true;
+    batterySoc = 100;
+  }
+
+  const cellVoltages = baseCells.map((v, i) =>
+    Number((v + drift + Math.sin(step * 0.65 + i * 1.1) * 0.0003).toFixed(3))
+  );
+  const batteryVoltage = Number(cellVoltages.reduce((a, b) => a + b, 0).toFixed(2));
+
+  return {
+    isConnected: true,
+    wifiConnected: true,
+    mqttConnected: true,
+    mongoConnected: true,
+    rssi: -54,
+    firmwareVersion: 'v1.0.5',
+    solarVoltage: 0,
+    batteryVoltage,
+    batteryCurrent,
+    batterySoc,
+    cellVoltages,
+    smpsState,
+    gridPresent,
+    inverterState,
+    flatlineDetected,
+    forceChargingActive: false,
+    modeString,
+    webModeOverride,
+    ip: '192.168.1.150',
+  };
+}
+
+const RANGE_DAYS = { '1d': 1, '7d': 7, '30d': 30, '60d': 60 };
+
+function buildDemoTrend(range) {
+  const days = RANGE_DAYS[range] || 1;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const spanSec = days * 86400;
+  const targetPts = days === 1 ? 180 : 320;
+  const stepSec = Math.max(120, Math.floor(spanSec / targetPts));
+  const pts = [];
+
+  for (let epoch = nowSec - spanSec; epoch <= nowSec; epoch += stepSec) {
+    const h = new Date(epoch * 1000).getHours() + new Date(epoch * 1000).getMinutes() / 60;
+    let phase = 'idle';
+    let batteryCurrent = 0;
+    let batteryVoltage = 13.34;
+    let batterySoc = 84;
+
+    if (h >= 12.5 && h < 14.5) {
+      phase = 'discharging';
+      const frac = (h - 12.5) / 2.0;
+      batteryCurrent = Number((12.4 + Math.sin(epoch / 300) * 1.4).toFixed(2));
+      batterySoc = Math.round(86 - frac * 34);
+      batteryVoltage = Number((13.18 - frac * 0.56).toFixed(2));
+    } else if (h >= 17.5 && h < 19.0) {
+      phase = 'charging';
+      const frac = (h - 17.5) / 1.5;
+      batteryCurrent = Number((-11.8 - Math.cos(epoch / 400) * 1.1).toFixed(2));
+      batterySoc = Math.round(52 + frac * 46);
+      batteryVoltage = Number((13.65 + frac * 0.78).toFixed(2));
+    } else if (h >= 19.5 && h < 21.5) {
+      phase = 'discharging';
+      const frac = (h - 19.5) / 2.0;
+      batteryCurrent = Number((9.6 + Math.sin(epoch / 360) * 1.6).toFixed(2));
+      batterySoc = Math.round(95 - frac * 22);
+      batteryVoltage = Number((13.24 - frac * 0.22).toFixed(2));
+    } else if (h >= 1.0 && h < 2.0) {
+      phase = 'charging';
+      const frac = h - 1.0;
+      batteryCurrent = -9.4;
+      batterySoc = Math.round(74 + frac * 24);
+      batteryVoltage = Number((13.85 + frac * 0.52).toFixed(2));
+    } else {
+      batteryVoltage = Number((13.33 + Math.sin(epoch / 1800) * 0.04).toFixed(2));
+    }
+
+    pts.push({ epoch, batteryVoltage, batteryCurrent, batterySoc, phase });
+  }
+  return pts;
+}
+
+function buildDemoDailyUptime() {
+  const days = [];
+  const now = Date.now();
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(now - i * 86400 * 1000);
+    const shortDay = d.toLocaleDateString('en-US', { weekday: 'short' });
+    const dateStr = d.toLocaleDateString();
+    const hours = [2.2, 4.1, 1.8, 4.6, 2.5, 3.8, 2.9][6 - i];
+    days.push({
+      dateKey: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`,
+      dateStr,
+      shortDay,
+      uptimeHours: hours,
+      deepDischargeCount: i === 3 ? 1 : 0,
+      minVoltage: i === 3 ? 12.34 : 12.82,
+      maxVoltage: 14.42
+    });
+  }
+  return days;
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('overview');
@@ -55,12 +186,20 @@ export default function App() {
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState([]);
+  const [trendHistory, setTrendHistory] = useState([]);
+  const [chartRange, setChartRange] = useState('1d');
+  const [trendLoading, setTrendLoading] = useState(false);
+  const [cellHistory, setCellHistory] = useState([]);
   const [logs, setLogs] = useState([]);
   const [cloudEvents, setCloudEvents] = useState([]);
   const [logFilter, setLogFilter] = useState('all');
   const [dailyHistory, setDailyHistory] = useState([]);
+  const [toasts, setToasts] = useState([]);
+  const [confirm, setConfirm] = useState(null);
+  const [demoMode, setDemoMode] = useState(false);
+  const [demoScenario, setDemoScenario] = useState('charging');
 
-  // PWA Install State
+  // PWA install state
   const [deferredPrompt, setDeferredPrompt] = useState(null);
   const [isStandalone, setIsStandalone] = useState(() => {
     if (typeof window === 'undefined') return false;
@@ -75,39 +214,42 @@ export default function App() {
   // Inverter uptime tracking
   const [inverterOnTime, setInverterOnTime] = useState(0);
   const [inverterSessions, setInverterSessions] = useState([]);
-  const inverterTimerRef = useRef(null);
   const prevInverterState = useRef(null);
   const inverterStartRef = useRef(null);
 
-  const addLog = (msg, type = 'info') => {
+  const addLog = useCallback((msg, type = 'info') => {
     const time = new Date().toLocaleTimeString();
     setLogs(prev => [{ id: Date.now() + Math.random(), time, msg, type, source: 'ui' }, ...prev.slice(0, 79)]);
-  };
+  }, []);
+
+  const toast = useCallback((msg, type = 'info') => {
+    const id = Date.now() + Math.random();
+    setToasts(prev => [...prev.slice(-3), { id, msg, type }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3800);
+  }, []);
 
   useEffect(() => {
     addLog('System initialized — MQTT + MongoDB Cloud Console active.', 'info');
-  }, []);
+  }, [addLog]);
 
   useEffect(() => {
     const handleBeforeInstallPrompt = (e) => {
       e.preventDefault();
       setDeferredPrompt(e);
     };
-
     const handleAppInstalled = () => {
       setIsStandalone(true);
       setDeferredPrompt(null);
       setShowIosInstallTip(false);
       addLog('App installed on device home screen.', 'success');
     };
-
     window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
     window.addEventListener('appinstalled', handleAppInstalled);
     return () => {
       window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
       window.removeEventListener('appinstalled', handleAppInstalled);
     };
-  }, []);
+  }, [addLog]);
 
   const handleInstallApp = async () => {
     if (deferredPrompt) {
@@ -119,41 +261,33 @@ export default function App() {
     }
   };
 
+  // Live telemetry polling (SSE cache / REST / LAN fallback)
   useEffect(() => {
+    if (demoMode) return undefined;
     let isMounted = true;
     async function updateStatus() {
       const data = await fetchSystemStatus(esp32Ip, connectionMode);
-      if (isMounted && data) {
-        setStatus(data);
-        if (data.ip && data.ip !== '0.0.0.0') {
-          setEsp32Ip(data.ip);
-        }
-        if (data.isConnected && data.batteryVoltage !== undefined) {
-          setHistory(prev => {
-            const next = [...prev, { time: new Date().toLocaleTimeString(), volt: data.batteryVoltage }];
-            return next.slice(-60);
-          });
-        }
-
-        // Track inverter ON/OFF transitions
-        const isOn = !!data.inverterState;
-        if (prevInverterState.current !== isOn) {
-          if (isOn) {
-            inverterStartRef.current = Date.now();
-            inverterTimerRef.current = setInterval(() => {
-              setInverterOnTime(prev => prev + 1);
-            }, 1000);
-          } else if (prevInverterState.current === true) {
-            if (inverterTimerRef.current) clearInterval(inverterTimerRef.current);
-            const duration = inverterStartRef.current ? Math.round((Date.now() - inverterStartRef.current) / 1000) : 0;
-            if (duration > 0) {
-              setInverterSessions(prev => [
-                { start: new Date(inverterStartRef.current).toLocaleTimeString(), duration },
-                ...prev.slice(0, 9)
-              ]);
-            }
+      if (!isMounted || !data) return;
+      setStatus(data);
+      if (data.ip && data.ip !== '0.0.0.0' && data.ip !== esp32Ip) {
+        setEsp32Ip(data.ip);
+      }
+      if (data.isConnected && data.batteryVoltage !== undefined) {
+        const now = Date.now();
+        const phase = getFlowDirection(Number(data.batteryCurrent ?? 0), !!data.smpsState);
+        setHistory(prev => [
+          ...prev,
+          {
+            epoch: Math.floor(now / 1000),
+            time: new Date(now).toLocaleTimeString(),
+            volt: Number(data.batteryVoltage),
+            batteryCurrent: Number(data.batteryCurrent ?? 0),
+            batterySoc: Number(data.batterySoc ?? 0),
+            phase,
           }
-          prevInverterState.current = isOn;
+        ].slice(-HISTORY_LEN));
+        if (Array.isArray(data.cellVoltages) && data.cellVoltages.length >= CELL_COUNT) {
+          setCellHistory(prev => [...prev, { t: now, cells: data.cellVoltages.slice(0, CELL_COUNT).map(Number) }].slice(-HISTORY_LEN));
         }
       }
     }
@@ -162,146 +296,164 @@ export default function App() {
     return () => {
       isMounted = false;
       clearInterval(interval);
-      if (inverterTimerRef.current) clearInterval(inverterTimerRef.current);
     };
-  }, [esp32Ip, connectionMode]);
+  }, [esp32Ip, connectionMode, demoMode]);
 
-  // Fetch long-term history & MongoDB events
+  // Opt-in live demo simulation mode
   useEffect(() => {
+    if (!demoMode) return undefined;
+
+    const now = Date.now();
+    const seedCount = 8;
+    const seedHist = [];
+    const seedCells = [];
+    let latestFrame = null;
+
+    for (let k = 0; k < seedCount; k++) {
+      const t = now - (seedCount - 1 - k) * 1500;
+      const frame = buildDemoFrame(demoScenario, k);
+      latestFrame = frame;
+      seedHist.push({
+        epoch: Math.floor(t / 1000),
+        time: new Date(t).toLocaleTimeString(),
+        volt: frame.batteryVoltage,
+        batteryCurrent: frame.batteryCurrent,
+        batterySoc: frame.batterySoc,
+        phase: getFlowDirection(frame.batteryCurrent, frame.smpsState),
+      });
+      seedCells.push({ t, cells: frame.cellVoltages });
+    }
+
+    setStatus(latestFrame);
+    setHistory(seedHist);
+    setCellHistory(seedCells);
+
+    let step = seedCount;
+    const timer = setInterval(() => {
+      const t = Date.now();
+      const frame = buildDemoFrame(demoScenario, step++);
+      setStatus(frame);
+      setHistory(prev => [
+        ...prev,
+        {
+          epoch: Math.floor(t / 1000),
+          time: new Date(t).toLocaleTimeString(),
+          volt: frame.batteryVoltage,
+          batteryCurrent: frame.batteryCurrent,
+          batterySoc: frame.batterySoc,
+          phase: getFlowDirection(frame.batteryCurrent, frame.smpsState),
+        }
+      ].slice(-HISTORY_LEN));
+      setCellHistory(prev => [...prev, { t, cells: frame.cellVoltages }].slice(-HISTORY_LEN));
+    }, 1500);
+
+    return () => clearInterval(timer);
+  }, [demoMode, demoScenario]);
+
+  // Inverter ON/OFF session tracking (independent of the polling effect)
+  const inverterOn = !!status?.inverterState;
+  useEffect(() => {
+    if (prevInverterState.current === inverterOn) return undefined;
+    if (inverterOn) {
+      inverterStartRef.current = Date.now();
+    } else if (prevInverterState.current === true && inverterStartRef.current) {
+      const start = inverterStartRef.current;
+      const duration = Math.round((Date.now() - start) / 1000);
+      if (duration > 0) {
+        setInverterSessions(prev => [{ start: new Date(start).toLocaleTimeString(), duration }, ...prev.slice(0, 9)]);
+      }
+      inverterStartRef.current = null;
+    }
+    prevInverterState.current = inverterOn;
+    return undefined;
+  }, [inverterOn]);
+
+  useEffect(() => {
+    if (!inverterOn) return undefined;
+    const id = setInterval(() => setInverterOnTime(prev => prev + 1), 1000);
+    return () => clearInterval(id);
+  }, [inverterOn]);
+
+  // Multi-day voltage trend fetching (1D / 7D / 30D / 60D)
+  useEffect(() => {
+    if (chartRange === 'live') {
+      setTrendLoading(false);
+      return undefined;
+    }
+
+    if (demoMode) {
+      setTrendLoading(false);
+      setTrendHistory(buildDemoTrend(chartRange));
+      return undefined;
+    }
+
+    let isMounted = true;
+    async function loadTrend() {
+      setTrendLoading(true);
+      const days = RANGE_DAYS[chartRange] || 1;
+      const data = await fetchHistory(connectionMode, days, 480);
+      if (!isMounted) return;
+      setTrendHistory(Array.isArray(data) ? data : []);
+      setTrendLoading(false);
+    }
+    loadTrend();
+    return () => { isMounted = false; };
+  }, [chartRange, connectionMode, demoMode]);
+
+  // Daily inverter uptime & MongoDB events
+  useEffect(() => {
+    if (demoMode) {
+      setDailyHistory(buildDemoDailyUptime());
+      return undefined;
+    }
     let isMounted = true;
     async function loadHistoryAndEvents() {
-      const [histData, eventsData] = await Promise.all([
-        fetchHistory(connectionMode),
-        fetchCloudEvents(connectionMode)
+      const [dailyData, eventsData] = await Promise.all([
+        fetchDailyUptime(connectionMode, 7),
+        fetchCloudEvents(connectionMode, 150)
       ]);
       if (!isMounted) return;
-
-      if (eventsData && eventsData.length > 0) {
-        setCloudEvents(eventsData);
-      }
-
-      if (!histData) return;
-
-      const dailyMap = {};
-      histData.forEach(h => {
-        const dateObj = new Date(h.epoch * 1000);
-        const dateStr = dateObj.toLocaleDateString();
-        const shortDay = dateObj.toLocaleDateString('en-US', { weekday: 'short' });
-
-        if (!dailyMap[dateStr]) {
-          dailyMap[dateStr] = {
-            dateStr,
-            shortDay,
-            uptimeChunks: 0,
-            deepDischargeCount: 0
-          };
-        }
-
-        if (h.inverterState) {
-          dailyMap[dateStr].uptimeChunks += 1;
-
-          if ((h.mode === 'MANUAL' || h.modeString === 'MANUAL') && h.batteryVoltage <= 12.5) {
-            dailyMap[dateStr].deepDischargeCount += 1;
-          }
-        }
-      });
-
-      const sortedDays = Object.values(dailyMap).slice(-7);
-      setDailyHistory(sortedDays);
+      if (Array.isArray(eventsData) && eventsData.length > 0) setCloudEvents(eventsData);
+      if (Array.isArray(dailyData)) setDailyHistory(dailyData);
     }
     loadHistoryAndEvents();
-  }, [connectionMode, activeTab]);
+    return () => { isMounted = false; };
+  }, [connectionMode, activeTab, demoMode]);
 
-  const formatTime = (totalSec) => {
-    const h = Math.floor(totalSec / 3600);
-    const m = Math.floor((totalSec % 3600) / 60);
-    const s = totalSec % 60;
-    if (h > 0) return `${h}h ${m}m ${s}s`;
-    if (m > 0) return `${m}m ${s}s`;
-    return `${s}s`;
-  };
-
-  // SVG Sparkline chart renderer
-  const renderVoltageChart = () => {
-    if (history.length < 2) return null;
-    const W = 600, H = 130, padX = 40, padY = 15;
-    const voltages = history.map(h => h.volt);
-    const minV = Math.min(...voltages) - 0.3;
-    const maxV = Math.max(...voltages) + 0.3;
-    const rangeV = maxV - minV || 1;
-    const chartW = W - padX * 2;
-    const chartH = H - padY * 2;
-
-    const points = history.map((h, i) => {
-      const x = padX + (i / (history.length - 1)) * chartW;
-      const y = padY + chartH - ((h.volt - minV) / rangeV) * chartH;
-      return `${x},${y}`;
+  // Live SSE cloud events subscription
+  useEffect(() => {
+    const unsubscribe = subscribeCloudEvents((ev) => {
+      setCloudEvents(prev => [ev, ...prev.slice(0, 149)]);
     });
+    return unsubscribe;
+  }, []);
 
-    const areaPoints = [
-      `${padX},${padY + chartH}`,
-      ...points,
-      `${padX + chartW},${padY + chartH}`
-    ].join(' ');
-
-    const gridLines = [];
-    const steps = 4;
-    for (let i = 0; i <= steps; i++) {
-      const y = padY + (i / steps) * chartH;
-      const v = maxV - (i / steps) * rangeV;
-      gridLines.push({ y, label: v.toFixed(1) });
-    }
-
-    return (
-      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: '100%' }}>
-        {gridLines.map((gl, i) => (
-          <g key={i}>
-            <line x1={padX} y1={gl.y} x2={W - padX} y2={gl.y} stroke="rgba(255,255,255,0.05)" strokeWidth="1" />
-            <text x={padX - 6} y={gl.y + 3} fill="var(--text-dim)" fontSize="8" textAnchor="end" fontFamily="var(--font-mono)">{gl.label}V</text>
-          </g>
-        ))}
-        <defs>
-          <linearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="rgba(56, 189, 248, 0.32)" />
-            <stop offset="100%" stopColor="rgba(56, 189, 248, 0.0)" />
-          </linearGradient>
-        </defs>
-        <polygon points={areaPoints} fill="url(#chartGrad)" />
-        <polyline
-          points={points.join(' ')}
-          fill="none"
-          stroke="var(--accent-cyan)"
-          strokeWidth="2.2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          style={{ filter: 'drop-shadow(0 0 6px rgba(56, 189, 248, 0.45))' }}
-        />
-        {history.length > 0 && (() => {
-          const lastPt = points[points.length - 1].split(',');
-          return (
-            <circle cx={lastPt[0]} cy={lastPt[1]} r="3.8" fill="var(--accent-cyan)" stroke="#fff" strokeWidth="1.5">
-              <animate attributeName="r" values="3.5;5.5;3.5" dur="2s" repeatCount="indefinite" />
-            </circle>
-          );
-        })()}
-      </svg>
-    );
-  };
-
-  const handleModeChange = async (modeVal) => {
-    const modeNames = { '-1': 'AUTO', '0': 'POWER OFF', '1': 'ECO', '2': 'POWER CUT', '3': 'ECO+PCUT', '4': 'MANUAL' };
-
-    const confirmed = window.confirm(`Are you sure you want to change the system mode to ${modeNames[modeVal] || 'this mode'}?`);
-    if (!confirmed) return;
-
+  // ---------- Actions ----------
+  const runModeChange = async (modeVal) => {
+    const mode = MODES.find(m => m.val === modeVal);
+    const name = mode?.label || modeVal;
     setLoading(true);
-    addLog(`Mode → ${modeNames[modeVal] || modeVal}`, 'action');
+    addLog(`Mode → ${name}`, 'action');
     const res = await setSystemMode(esp32Ip, connectionMode, modeVal);
     if (res?.success) {
       setStatus(prev => prev ? { ...prev, webModeOverride: modeVal } : prev);
-      addLog(`MQTT Command Delivered: Mode set to ${modeNames[modeVal]}`, 'success');
+      addLog(`MQTT command delivered: mode set to ${name}`, 'success');
+      toast(`Mode set to ${name}`, 'success');
+    } else {
+      toast(`Could not change mode to ${name}`, 'danger');
     }
     setLoading(false);
+  };
+
+  const handleModeChange = (modeVal) => {
+    const mode = MODES.find(m => m.val === modeVal);
+    setConfirm({
+      title: `Switch to ${mode?.label}?`,
+      message: `${mode?.sub}. The command is sent to the ESP32 immediately.`,
+      confirmLabel: `Switch to ${mode?.label}`,
+      tone: modeVal === 0 ? 'danger' : 'brand',
+      onConfirm: () => runModeChange(modeVal),
+    });
   };
 
   const handleForceChargeToggle = async () => {
@@ -311,7 +463,10 @@ export default function App() {
     const res = await toggleForceCharging(esp32Ip, connectionMode, nextState);
     if (res?.success) {
       setStatus(prev => prev ? { ...prev, forceChargingActive: nextState, smpsState: nextState } : prev);
-      addLog(`SMPS Charger ${nextState ? 'FORCE ON' : 'STANDBY'}`, nextState ? 'warning' : 'info');
+      addLog(`SMPS charger ${nextState ? 'FORCE ON' : 'STANDBY'}`, nextState ? 'warning' : 'info');
+      toast(nextState ? 'Force charge activated' : 'Force charge stopped', nextState ? 'warning' : 'success');
+    } else {
+      toast('Could not toggle force charge', 'danger');
     }
     setLoading(false);
   };
@@ -326,56 +481,69 @@ export default function App() {
         ? { ...prev, inverterState: !currentState }
         : { ...prev, smpsState: !currentState };
     });
+    toast(`${relayType === 'inverter' ? 'Inverter' : 'SMPS'} relay ${!currentState ? 'ON' : 'OFF'}`, 'info');
     setLoading(false);
   };
 
-  const handleOtaTrigger = async () => {
+  const runOta = async () => {
     setLoading(true);
-    const firmwareUrl = "https://raw.githubusercontent.com/AshanDilakshana/smart-sola-offgrid-system/main/smart_offgrid_logic_/build/smart_offgrid_logic_.ino.bin";
-    addLog(`Initiating OTA Update via MQTT from GitHub Binary...`, 'warning');
+    const firmwareUrl = 'https://raw.githubusercontent.com/AshanDilakshana/smart-sola-offgrid-system/main/smart_offgrid_logic_/build/smart_offgrid_logic_.ino.bin';
+    addLog('Initiating OTA update via MQTT from GitHub binary…', 'warning');
     const res = await triggerOtaUpdate(esp32Ip, connectionMode, firmwareUrl);
     if (res?.success) {
-      addLog(`OTA Update command sent! ESP32 downloading & flashing...`, 'success');
+      addLog('OTA update command sent! ESP32 downloading & flashing…', 'success');
+      toast('OTA command sent — ESP32 is flashing', 'success');
+    } else {
+      toast('Failed to trigger OTA firmware update', 'danger');
     }
     setLoading(false);
   };
 
+  const handleOtaTrigger = () => {
+    setConfirm({
+      title: 'Install latest firmware?',
+      message: 'The ESP32 will download the latest build and reboot. Relays keep their safe state during the update.',
+      confirmLabel: 'Start OTA update',
+      tone: 'brand',
+      onConfirm: runOta,
+    });
+  };
+
   const handleSaveBackendUrl = () => {
     setBackendUrl(backendUrlInput);
-    addLog(`Hosted Backend URL updated to: ${backendUrlInput}`, 'success');
+    addLog(`Hosted backend URL updated to: ${backendUrlInput}`, 'success');
+    saveCloudEvent(connectionMode, `Dashboard backend endpoint updated to ${backendUrlInput}`, 'info');
+    toast('Backend URL saved', 'success');
   };
 
-  const calculateSoc = (volt) => {
-    if (!volt) return 0;
-    return Math.min(100, Math.max(0, Math.round(((volt - 11.5) / (14.4 - 11.5)) * 100)));
+  const toggleConnection = () => {
+    const nextMode = connectionMode === 'cloud' ? 'local' : 'cloud';
+    setConnectionMode(nextMode);
+    addLog(`Connection mode switched to ${nextMode.toUpperCase()}`, 'info');
   };
 
-  const batVolt = status?.batteryVoltage ?? 13.4;
-  const batCurrent = status?.batteryCurrent ?? 0;
-  const liveWatts = Math.round(batVolt * Math.abs(batCurrent));
-  const soc = status?.batterySoc !== undefined && status.batterySoc > 0 ? status.batterySoc : calculateSoc(batVolt);
+  const toggleDemoMode = useCallback(() => {
+    setDemoMode((prev) => {
+      const next = !prev;
+      setHistory([]);
+      setCellHistory([]);
+      setStatus(null);
+      addLog(
+        next ? 'Simulation preview mode enabled.' : 'Simulation preview exited — resuming live telemetry.',
+        'info'
+      );
+      toast(next ? 'Simulation preview active' : 'Resuming live telemetry', 'info');
+      return next;
+    });
+  }, [addLog, toast]);
 
-  // SVG Gauge math
-  const radius = 78;
-  const circumference = 2 * Math.PI * radius;
-  const strokeDashoffset = circumference - (soc / 100) * (circumference * 0.75);
+  // ---------- Derived values ----------
+  const connected = !!status?.isConnected && status?.batteryVoltage !== undefined;
+  const batVolt = Number(status?.batteryVoltage ?? 0);
+  const rawCurrent = Number(status?.batteryCurrent ?? 0);
+  const soc = status?.batterySoc !== undefined && status.batterySoc > 0 ? Math.round(status.batterySoc) : packSocFromVoltage(batVolt);
+  const direction = getFlowDirection(rawCurrent, !!status?.smpsState);
 
-  const getSocColor = () => {
-    if (status?.smpsState) return 'var(--accent-cyan)';
-    if (soc > 60) return 'var(--accent-green)';
-    if (soc > 30) return 'var(--accent-yellow)';
-    return 'var(--accent-red)';
-  };
-
-  const tabs = [
-    { id: 'overview', label: 'Overview', mobileLabel: 'Overview', icon: <Activity size={16} /> },
-    { id: 'controls', label: 'Controls', mobileLabel: 'Controls', icon: <Sliders size={16} /> },
-    { id: 'timers', label: 'Timers & Logic', mobileLabel: 'Timers', icon: <Clock size={16} /> },
-    { id: 'settings', label: 'Cloud & OTA', mobileLabel: 'Cloud', icon: <SlidersHorizontal size={16} /> },
-    { id: 'logs', label: 'Event Logs', mobileLabel: 'Logs', icon: <FileText size={16} /> },
-  ];
-
-  // Combine UI logs + MongoDB Cloud Event logs
   const mergedLogs = [
     ...logs,
     ...cloudEvents.map((ev, idx) => ({
@@ -386,941 +554,170 @@ export default function App() {
       source: 'mongodb'
     }))
   ].filter(item => {
-    if (logFilter === 'all') return true;
     if (logFilter === 'action') return item.type === 'action' || item.type === 'success';
     if (logFilter === 'alert') return item.type === 'warning' || item.type === 'danger';
     return true;
   });
 
   return (
-    <div className="app-container">
-      {/* =================== MODERN HEADER =================== */}
-      <header className="app-header">
-        <div className="header-top-row">
-          <div className="brand-title">
-            <div className="brand-icon">
-              <Zap size={22} />
+    <div className="app-shell">
+      <div className="bg-aurora" aria-hidden="true" />
+      <div className="bg-grid" aria-hidden="true" />
+      {!status && <div className="top-progress" aria-hidden="true" />}
+
+      <div className="app-container">
+        <Header
+          status={status}
+          tabs={TABS}
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
+          connectionMode={connectionMode}
+          onToggleConnection={toggleConnection}
+          esp32Ip={esp32Ip}
+          onIpChange={setEsp32Ip}
+          showInstall={!isStandalone && (deferredPrompt || isIos)}
+          onInstall={handleInstallApp}
+          demoMode={demoMode}
+          onToggleDemo={toggleDemoMode}
+        />
+
+        {demoMode && (
+          <div className="demo-bar reveal">
+            <div className="demo-bar-label">
+              <FlaskConical size={16} />
+              <span><strong>Simulation Mode</strong> (Demo Data)</span>
             </div>
-            <div className="brand-text">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <h1>Smart Solar Off-Grid OS</h1>
-                <span className="live-pill">
-                  <span className={`pulse-dot ${status?.isConnected ? 'green' : 'red'}`}></span>
-                  {status?.localFallbackActive
-                    ? 'LAN FALLBACK'
-                    : status?.isConnected
-                      ? 'MQTT LIVE'
-                      : 'OFFLINE'}
-                </span>
-              </div>
-              <p>ESP32 Dual-Core BMS &bull; AWS IoT MQTT &bull; MongoDB Atlas Telemetry</p>
+            <div className="demo-scenarios" role="group" aria-label="Simulation scenario">
+              {DEMO_SCENARIOS.map((sc) => (
+                <button
+                  key={sc.id}
+                  type="button"
+                  className={`demo-pill ${demoScenario === sc.id ? 'is-on' : ''}`}
+                  onClick={() => setDemoScenario(sc.id)}
+                >
+                  {sc.label}
+                </button>
+              ))}
             </div>
-          </div>
-
-          <div className="connection-bar">
-            {/* Architecture Health Pills */}
-            <span
-              className={`badge ${status?.mqttConnected !== false && status?.isConnected ? 'badge-info' : 'badge-warning'}`}
-              title="MQTT Broker Link Status"
-            >
-              <Server size={12} />
-              {status?.localFallbackActive ? 'Direct LAN' : 'MQTT Broker'}
-            </span>
-
-            <span
-              className={`badge ${status?.mongoConnected ? 'badge-success' : 'badge-purple'}`}
-              title="MongoDB Atlas Cloud Database"
-            >
-              <Database size={12} />
-              MongoDB
-            </span>
-
-            {status?.wifiConnected ? (
-              <Wifi size={16} className="text-green" title={`Wi-Fi Connected (${status?.rssi || -60} dBm)`} />
-            ) : (
-              <WifiOff size={16} className="text-red" title="Wi-Fi Disconnected" />
-            )}
-
-            {connectionMode === 'local' && (
-              <input
-                type="text"
-                className="ip-input"
-                value={esp32Ip}
-                onChange={(e) => setEsp32Ip(e.target.value)}
-                placeholder="192.168.1.150"
-              />
-            )}
-
-            <button
-              className={`badge ${connectionMode === 'cloud' ? 'badge-info' : 'badge-warning'}`}
-              onClick={() => {
-                const nextMode = connectionMode === 'cloud' ? 'local' : 'cloud';
-                setConnectionMode(nextMode);
-                addLog(`Connection Mode switched to ${nextMode.toUpperCase()}`, 'info');
-              }}
-            >
-              {connectionMode === 'cloud' ? '🌐 Cloud MQTT' : '🏠 Local IP'}
+            <button type="button" className="btn btn--ghost btn--sm" onClick={toggleDemoMode}>
+              Exit Demo
             </button>
-
-            <span className="badge badge-purple" title="ESP32 Firmware Version">
-              <Cpu size={11} /> {status?.firmwareVersion || 'v1.0.5'}
-            </span>
-
-            {!isStandalone && (deferredPrompt || isIos) && (
-              <button
-                className="badge badge-install"
-                onClick={handleInstallApp}
-                title="Install Smart Solar as Mobile App"
-              >
-                <Download size={12} /> Install App
-              </button>
-            )}
           </div>
-        </div>
+        )}
 
-        <nav className="nav-tabs">
-          {tabs.map(tab => (
-            <button
-              key={tab.id}
-              className={`nav-tab-btn ${activeTab === tab.id ? 'active' : ''}`}
-              onClick={() => setActiveTab(tab.id)}
-            >
-              {tab.icon} {tab.label}
-            </button>
-          ))}
-        </nav>
-      </header>
-
-      {/* iOS Safari Install Guide Banner */}
-      {showIosInstallTip && !isStandalone && (
-        <div className="glass-card animate-in" style={{ borderColor: 'rgba(56, 189, 248, 0.35)', background: 'rgba(56, 189, 248, 0.08)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', padding: '0.85rem 1.15rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-            <Smartphone size={18} className="text-cyan" style={{ flexShrink: 0 }} />
+        {showIosInstallTip && !isStandalone && (
+          <div className="banner tone-brand">
+            <Smartphone size={18} />
             <span>
-              Tap the <strong style={{ color: 'var(--text-main)' }}>Share</strong> icon in Safari &rarr; <strong style={{ color: 'var(--accent-cyan)' }}>&quot;Add to Home Screen&quot;</strong> to install Smart Solar as an app.
+              Tap <strong>Share</strong> in Safari → <strong>Add to Home Screen</strong> to install Smart Solar as an app.
             </span>
+            <button className="icon-btn" onClick={() => setShowIosInstallTip(false)} aria-label="Close install tip"><X size={14} /></button>
           </div>
-          <button
-            className="badge"
-            style={{ background: 'rgba(255,255,255,0.06)', color: 'var(--text-muted)', padding: '0.3rem' }}
-            onClick={() => setShowIosInstallTip(false)}
-            aria-label="Close install tip"
-          >
-            <X size={14} />
-          </button>
-        </div>
-      )}
+        )}
 
-      {/* Local Fallback Active Info Banner */}
-      {status?.localFallbackActive && (
-        <div className="glass-card animate-in" style={{ borderColor: 'var(--accent-yellow)', background: 'rgba(234, 179, 8, 0.1)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', padding: '0.85rem 1.25rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <ShieldAlert size={20} className="text-yellow" />
-            <div style={{ fontSize: '0.8rem' }}>
-              <strong style={{ color: 'var(--accent-yellow)' }}>Offline LAN Auto-Fallback Active:</strong> Cloud backend or internet is unreachable, seamlessly communicating directly with ESP32 at <code>http://{esp32Ip}</code>.
-            </div>
+        {!demoMode && status?.localFallbackActive && (
+          <div className="banner tone-warning">
+            <ShieldAlert size={18} />
+            <span>
+              <strong>LAN auto-fallback active.</strong> Cloud backend unreachable — talking directly to the ESP32 at <code>http://{esp32Ip}</code>.
+            </span>
+            <span className="chip chip--warning">Zero-downtime</span>
           </div>
-          <span className="badge badge-warning">Zero-Downtime Mode</span>
-        </div>
-      )}
+        )}
 
-      {/* Connection Error Alert Banner */}
-      {status && status.isConnected === false && (
-        <div className="glass-card animate-in" style={{ borderColor: 'var(--accent-red)', background: 'rgba(239, 68, 68, 0.12)', color: 'var(--text-main)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem', padding: '1rem 1.25rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <AlertTriangle size={24} className="text-red" style={{ flexShrink: 0 }} />
-            <div>
-              <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--accent-red)' }}>
-                Telemetry Link Offline — ESP32 Running Autonomous Hardware Protection
-              </div>
-              <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginTop: '0.1rem' }}>
-                {status.error || 'Unable to reach Cloud Backend or Local ESP32. Core 1 (BMS, Timers, Relays & RTC) continues operating autonomously & buffering history in RAM.'}
-              </div>
-            </div>
-          </div>
-          <button
-            className="badge badge-warning"
-            onClick={() => setConnectionMode(connectionMode === 'cloud' ? 'local' : 'cloud')}
-          >
-            Try {connectionMode === 'cloud' ? 'Local IP Mode' : 'Cloud Mode'}
-          </button>
-        </div>
-      )}
-
-      {/* =================== TAB: OVERVIEW =================== */}
-      {activeTab === 'overview' && (
-        <div className="animate-in" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-          {/* Status Strip */}
-          <div className="status-strip">
-            <div className="status-chip">
-              <div className={`status-chip-icon ${status?.gridPresent ? 'green' : 'red'}`}>
-                <PlugZap size={18} />
-              </div>
-              <div className="status-chip-text">
-                <span className="status-chip-label">Main Grid</span>
-                <span className="status-chip-value" style={{ color: status?.gridPresent ? 'var(--accent-green)' : 'var(--accent-red)' }}>
-                  {status?.gridPresent ? 'ONLINE' : 'POWER CUT'}
-                </span>
-              </div>
-            </div>
-
-            <div className="status-chip">
-              <div className={`status-chip-icon ${status?.inverterState ? 'cyan' : 'purple'}`}>
-                <Power size={18} />
-              </div>
-              <div className="status-chip-text">
-                <span className="status-chip-label">Inverter Output</span>
-                <span className="status-chip-value" style={{ color: status?.inverterState ? 'var(--accent-cyan)' : 'var(--text-main)' }}>
-                  {status?.inverterState ? 'ACTIVE (ON)' : 'STANDBY'}
-                </span>
-              </div>
-            </div>
-
-            <div className="status-chip">
-              <div className={`status-chip-icon ${status?.smpsState ? 'cyan' : 'yellow'}`}>
-                <BatteryCharging size={18} />
-              </div>
-              <div className="status-chip-text">
-                <span className="status-chip-label">SMPS Charger</span>
-                <span className="status-chip-value" style={{ color: status?.smpsState ? 'var(--accent-cyan)' : 'var(--text-secondary)' }}>
-                  {status?.smpsState ? 'CHARGING' : 'STANDBY'}
-                </span>
-              </div>
-            </div>
-
-            <div className="status-chip">
-              <div className="status-chip-icon cyan">
-                <Signal size={18} />
-              </div>
-              <div className="status-chip-text">
-                <span className="status-chip-label">Wi-Fi Signal</span>
-                <span className="status-chip-value">
-                  {status?.rssi ? `${status.rssi} dBm` : '—'}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* =================== LIVE ENERGY FLOW TOPOLOGY BAR =================== */}
-          <div className="glass-card power-flow-card">
-            <div className="card-header" style={{ marginBottom: '0.85rem' }}>
-              <span className="card-label" style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                <Zap size={14} color="var(--accent-cyan)" /> Real-Time Power Routing Topology
-              </span>
-              <span className="badge badge-info">
-                Mode: {status?.modeString || 'POWER OFF'}
-              </span>
-            </div>
-
-            <div className="power-flow-pipeline">
-              {/* Node 1: Main Grid */}
-              <div className={`flow-node ${status?.gridPresent ? 'node-online' : 'node-offline'}`}>
-                <PlugZap size={20} />
-                <div>
-                  <div className="flow-node-title">Main Grid (AC)</div>
-                  <div className="flow-node-sub">{status?.gridPresent ? '230V Online' : 'Grid Down'}</div>
-                </div>
-              </div>
-
-              {/* Arrow 1: Grid -> SMPS */}
-              <div className={`flow-connector ${status?.gridPresent && status?.smpsState ? 'flow-active-cyan' : ''}`}>
-                <div className="flow-line"></div>
-                <ArrowRight size={16} />
-              </div>
-
-              {/* Node 2: SMPS Charger */}
-              <div className={`flow-node ${status?.smpsState ? 'node-charging' : ''}`}>
-                <BatteryCharging size={20} />
-                <div>
-                  <div className="flow-node-title">SMPS Charger</div>
-                  <div className="flow-node-sub">{status?.smpsState ? 'Charging Active' : 'Standby'}</div>
-                </div>
-              </div>
-
-              {/* Arrow 2: SMPS -> Battery */}
-              <div className={`flow-connector ${status?.smpsState ? 'flow-active-green' : ''}`}>
-                <div className="flow-line"></div>
-                <ArrowRight size={16} />
-              </div>
-
-              {/* Node 3: 4S LiFePO4 Battery + JK BMS */}
-              <div className="flow-node node-battery">
-                <Battery size={20} />
-                <div>
-                  <div className="flow-node-title">4S LiFePO4 ({soc}%)</div>
-                  <div className="flow-node-sub">{batVolt.toFixed(2)}V &bull; {batCurrent.toFixed(1)}A ({liveWatts}W)</div>
-                </div>
-              </div>
-
-              {/* Arrow 3: Battery -> Inverter */}
-              <div className={`flow-connector ${status?.inverterState ? 'flow-active-purple' : ''}`}>
-                <div className="flow-line"></div>
-                <ArrowRight size={16} />
-              </div>
-
-              {/* Node 4: Inverter Backup Output */}
-              <div className={`flow-node ${status?.inverterState ? 'node-inverter-on' : ''}`}>
-                <Power size={20} />
-                <div>
-                  <div className="flow-node-title">Inverter Output</div>
-                  <div className="flow-node-sub">{status?.inverterState ? `ON (${formatTime(inverterOnTime)})` : 'Relay OFF'}</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* =================== BATTERY HERO GAUGE & METRICS =================== */}
-          <div className="battery-hero glass-card">
-            <div className="battery-info">
-              <div className="battery-info-header">
-                <Battery size={18} color="var(--accent-cyan)" />
-                <span>JK BMS Smart Battery Telemetry</span>
-              </div>
-              <div className="battery-voltage">
-                {batVolt.toFixed(2)}<span className="unit">V</span>
-              </div>
-
-              {/* Live Power & Current Mini Chips */}
-              <div className="battery-metrics-row">
-                <div className="battery-metric-chip">
-                  <span className="battery-metric-label">
-                    <Zap size={12} color="var(--accent-cyan)" /> Live Power
-                  </span>
-                  <div className="battery-metric-val">
-                    {liveWatts}<span className="unit">W</span>
-                  </div>
-                  <span className="battery-metric-sub" style={{ color: batCurrent < -0.05 ? 'var(--accent-green)' : batCurrent > 0.05 ? 'var(--accent-orange)' : 'var(--text-muted)' }}>
-                    {batCurrent < -0.05 ? '▲ Charging Flow' : batCurrent > 0.05 ? '▼ Load Discharge' : '• Standby Idle'}
-                  </span>
-                </div>
-
-                <div className="battery-metric-chip">
-                  <span className="battery-metric-label">
-                    <Timer size={12} color="var(--accent-purple)" /> Inverter Uptime
-                  </span>
-                  <div className="battery-metric-val">
-                    {formatTime(inverterOnTime)}
-                  </div>
-                  <span className="battery-metric-sub" style={{ color: status?.inverterState ? 'var(--accent-green)' : 'var(--text-muted)' }}>
-                    {status?.inverterState ? '⚡ Backup Running' : 'Inverter Standby'}
-                  </span>
-                </div>
-              </div>
-
-              <div className="battery-badges">
-                {status?.smpsState && (
-                  <span className="badge badge-info">
-                    <RefreshCw size={11} className="spin" /> SMPS Active
-                  </span>
-                )}
-                <span className={`badge ${status?.smpsState || batCurrent < -0.05 ? 'badge-info' : soc > 30 ? 'badge-success' : 'badge-danger'}`}>
-                  {status?.smpsState || batCurrent < -0.05 ? '⚡ Charging Bank' : soc > 30 ? '✓ Bank Healthy' : '⚠ Bank Low'}
-                </span>
-                {status?.forceChargingActive && (
-                  <span className="badge badge-warning">Force Charge ON</span>
-                )}
-                {status?.flatlineDetected && (
-                  <span className="badge badge-success">dV/dt Full Cutoff</span>
-                )}
-              </div>
-            </div>
-
-            <div className="gauges-container" style={{ display: 'flex', gap: '1.75rem', flexWrap: 'wrap', justifyContent: 'center' }}>
-              {/* Voltage & SOC Gauge */}
-              <div className="svg-gauge-wrapper">
-                <svg width="100%" height="100%" viewBox="0 0 200 200">
-                  <circle
-                    cx="100" cy="100" r={radius}
-                    fill="none"
-                    stroke="rgba(255,255,255,0.04)"
-                    strokeWidth="14"
-                    strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
-                    transform="rotate(135 100 100)"
-                  />
-                  <circle
-                    cx="100" cy="100" r={radius}
-                    fill="none"
-                    stroke={soc > 60 ? 'url(#greenGrad)' : soc > 30 ? 'url(#yellowGrad)' : 'url(#redGrad)'}
-                    strokeWidth="14"
-                    strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
-                    strokeDashoffset={strokeDashoffset}
-                    strokeLinecap="round"
-                    transform="rotate(135 100 100)"
-                    style={{ transition: 'stroke-dashoffset 1s cubic-bezier(0.4, 0, 0.2, 1)' }}
-                  />
-                  <defs>
-                    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                      <stop offset="0%" stopColor="#38bdf8" />
-                      <stop offset="100%" stopColor="#6366f1" />
-                    </linearGradient>
-                    <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                      <stop offset="0%" stopColor="#22c55e" />
-                      <stop offset="100%" stopColor="#10b981" />
-                    </linearGradient>
-                    <linearGradient id="yellowGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                      <stop offset="0%" stopColor="#eab308" />
-                      <stop offset="100%" stopColor="#f59e0b" />
-                    </linearGradient>
-                    <linearGradient id="redGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                      <stop offset="0%" stopColor="#ef4444" />
-                      <stop offset="100%" stopColor="#f97316" />
-                    </linearGradient>
-                  </defs>
-                </svg>
-                <div className="svg-gauge-text">
-                  <div className="svg-gauge-val" style={{ color: getSocColor() }}>
-                    {batVolt.toFixed(1)}<span>V</span>
-                  </div>
-                  <div className="svg-gauge-sub">SOC: {soc}%</div>
-                </div>
-              </div>
-
-              {/* Amperage Gauge */}
-              <div className="svg-gauge-wrapper">
-                <svg width="100%" height="100%" viewBox="0 0 200 200">
-                  <circle
-                    cx="100" cy="100" r={radius}
-                    fill="none"
-                    stroke="rgba(255,255,255,0.04)"
-                    strokeWidth="14"
-                    strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
-                    transform="rotate(135 100 100)"
-                  />
-                  <circle
-                    cx="100" cy="100" r={radius}
-                    fill="none"
-                    stroke={batCurrent < -0.05 ? 'url(#greenGrad)' : batCurrent > 0.05 ? 'url(#redGrad)' : 'url(#cyanGrad)'}
-                    strokeWidth="14"
-                    strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
-                    strokeDashoffset={circumference * 0.75 - ((circumference * 0.75) * Math.min(100, (Math.abs(batCurrent) / 30) * 100)) / 100}
-                    strokeLinecap="round"
-                    transform="rotate(135 100 100)"
-                    style={{ transition: 'stroke-dashoffset 1s cubic-bezier(0.4, 0, 0.2, 1)' }}
-                  />
-                </svg>
-                <div className="svg-gauge-text">
-                  <div className="svg-gauge-val" style={{ color: batCurrent < -0.05 ? 'var(--accent-green)' : batCurrent > 0.05 ? 'var(--accent-red)' : 'var(--accent-cyan)' }}>
-                    {Math.abs(batCurrent).toFixed(1)}<span>A</span>
-                  </div>
-                  <div className="svg-gauge-sub" style={{ color: batCurrent < -0.05 ? 'var(--accent-green)' : batCurrent > 0.05 ? 'var(--accent-red)' : 'var(--text-muted)' }}>
-                    {batCurrent < -0.05 ? 'Charging Amps' : batCurrent > 0.05 ? 'Discharge Amps' : 'Idle Amps'}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* =================== 4-CELL VOLTAGE BALANCE BAR CHART =================== */}
-          <div className="cell-balance-card glass-card">
-            <div className="cell-balance-header">
-              <div className="cell-balance-title">
-                <BatteryCharging size={18} color="var(--accent-cyan)" />
-                <span>4-Cell LiFePO4 Lithium Balance Monitor (JK BMS)</span>
-              </div>
-
-              {(() => {
-                const cells = status?.cellVoltages && status.cellVoltages.length >= 4 ? status.cellVoltages : [3.60, 3.59, 3.59, 3.60];
-                const valid = cells.filter(v => v > 1.0);
-                const minV = valid.length ? Math.min(...valid) : 3.59;
-                const maxV = valid.length ? Math.max(...valid) : 3.60;
-                const avgV = valid.length ? (valid.reduce((a, b) => a + b, 0) / valid.length) : 3.595;
-                const delta = (maxV - minV).toFixed(3);
-                return (
-                  <div className="cell-balance-delta">
-                    <span className="badge badge-info" title="Average Cell Voltage">
-                      Avg: {avgV.toFixed(3)} V
-                    </span>
-                    <span className="badge badge-purple" title="Max cell difference">
-                      ΔV: {delta} V
-                    </span>
-                    <span className={`badge ${parseFloat(delta) < 0.03 ? 'badge-success' : parseFloat(delta) < 0.08 ? 'badge-warning' : 'badge-danger'}`}>
-                      {parseFloat(delta) < 0.03 ? '✓ Perfect Balance' : parseFloat(delta) < 0.08 ? '⚡ Balancing' : '⚠ Imbalanced'}
-                    </span>
-                  </div>
-                );
-              })()}
-            </div>
-
-            <div className="cell-bars-grid">
-              {[0, 1, 2, 3].map((idx) => {
-                const cells = status?.cellVoltages && status.cellVoltages.length > idx && status.cellVoltages[idx] > 1.0
-                  ? status.cellVoltages
-                  : [3.601, 3.598, 3.595, 3.594];
-                const v = cells[idx] || 3.60;
-                const pct = Math.min(100, Math.max(5, Math.round(((v - 2.80) / (3.65 - 2.80)) * 100)));
-                const barColor = v >= 3.45 ? 'linear-gradient(90deg, #38bdf8, #22c55e)' : v >= 3.20 ? 'linear-gradient(90deg, #22c55e, #10b981)' : v >= 3.00 ? 'linear-gradient(90deg, #eab308, #f59e0b)' : 'linear-gradient(90deg, #ef4444, #f97316)';
-
-                return (
-                  <div key={idx} className="cell-item">
-                    <div className="cell-top-row">
-                      <span className="cell-badge-num">
-                        <Battery size={12} color="var(--accent-cyan)" /> Cell {idx + 1}
-                      </span>
-                      <span className="badge badge-info" style={{ padding: '0.15rem 0.45rem', fontSize: '0.65rem' }}>
-                        {pct}%
-                      </span>
-                    </div>
-
-                    <div className="cell-volt-val">
-                      {v.toFixed(3)}<span className="unit">V</span>
-                    </div>
-
-                    <div className="cell-bar-track">
-                      <div
-                        className="cell-bar-fill"
-                        style={{
-                          width: `${pct}%`,
-                          background: barColor,
-                          boxShadow: `0 0 10px ${v >= 3.3 ? 'rgba(34, 197, 94, 0.35)' : 'rgba(234, 179, 8, 0.35)'}`
-                        }}
-                      />
-                    </div>
-
-                    <div className="cell-footer-row">
-                      <span>2.80V min</span>
-                      <span>3.65V max</span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Overview Cards */}
-          <div className="overview-cards-grid">
-            {/* Active Mode */}
-            <div className="glass-card info-card">
-              <div className="card-header">
-                <span className="card-label">Active Operating Mode</span>
-                <div className="pulse-dot cyan"></div>
-              </div>
-              <div className="active-mode-card">
-                <div>
-                  <div className="active-mode-value">{status?.modeString || 'POWER OFF'}</div>
-                  <div className="active-mode-sub">
-                    {status?.webModeOverride === -1 ? 'Auto (Hardware Enclosure Switches)' : 'Cloud / Web Override Active'}
-                  </div>
-                </div>
-                <button className="btn-go-controls" onClick={() => setActiveTab('controls')}>
-                  Change <ChevronRight size={14} />
-                </button>
-              </div>
-            </div>
-
-            {/* Force Charge Quick */}
-            <div className="glass-card info-card">
-              <div className="card-header">
-                <span className="card-label">Instant SMPS Boost</span>
-                <Zap size={16} color="var(--accent-yellow)" />
-              </div>
-              <div className="force-charge-section">
-                <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                  Instantly trigger SMPS charger via MQTT (auto cut-off at 15.5V).
-                </p>
-                <button
-                  className={`btn-force-charge ${status?.forceChargingActive ? 'btn-force-charge-on' : 'btn-force-charge-off'}`}
-                  onClick={handleForceChargeToggle}
-                  disabled={loading}
-                >
-                  <Zap size={16} />
-                  {status?.forceChargingActive ? 'STOP CHARGE' : 'FORCE CHARGE'}
-                </button>
-              </div>
-            </div>
-
-            {/* Grid Status */}
-            <div className="glass-card info-card">
-              <div className="card-header">
-                <span className="card-label">Main Grid Sensing</span>
-                <Radio size={16} color={status?.gridPresent ? 'var(--accent-green)' : 'var(--accent-red)'} />
-              </div>
-              <div className="card-value" style={{ color: status?.gridPresent ? 'var(--accent-green)' : 'var(--accent-red)' }}>
-                {status?.gridPresent ? 'ONLINE' : 'POWER CUT'}
-              </div>
-              <div className="card-subtitle">1,000ms noise debounce &bull; 120s transfer delay</div>
-            </div>
-
-            {/* Solar PV */}
-            <div className="glass-card info-card">
-              <div className="card-header">
-                <span className="card-label">Solar PV Array</span>
-                <Sun size={16} color="var(--accent-yellow)" />
-              </div>
-              <div className="card-value">0.0<span style={{ fontSize: '0.9rem', color: 'var(--text-muted)', fontWeight: 500 }}> V</span></div>
-              <div className="card-subtitle">Battery Backup Mode (PV Sensor bypassed)</div>
-            </div>
-          </div>
-
-          {/* ====== CHARTS SECTION ====== */}
-          <div className="charts-grid">
-            {/* Battery Voltage History Graph */}
-            <div className="glass-card chart-card">
-              <div className="card-header">
-                <span className="card-label">Live Battery Voltage Waveform</span>
-                <TrendingDown size={16} color="var(--accent-cyan)" />
-              </div>
-              <div className="chart-container">
-                {history.length < 2 ? (
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)', fontSize: '0.78rem' }}>
-                    Streaming live MQTT telemetry...
-                  </div>
-                ) : renderVoltageChart()}
-              </div>
-              <div className="chart-footer">
-                <span>{history.length} live samples</span>
-                <span>2s real-time interval</span>
-              </div>
-            </div>
-
-            {/* Daily Inverter Uptime Bar Chart (From MongoDB) */}
-            <div className="glass-card chart-card">
-              <div className="card-header">
-                <span className="card-label">7-Day Inverter Uptime (MongoDB)</span>
-                <Clock3 size={16} color="var(--accent-cyan)" />
-              </div>
-
-              <div className="bar-chart-container">
-                {dailyHistory.length === 0 ? (
-                  <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.8rem', padding: '2rem 0' }}>
-                    Loading MongoDB history...
-                  </div>
-                ) : (
-                  <div className="bar-chart">
-                    {dailyHistory.map((day, idx) => {
-                      const hours = (day.uptimeChunks * 15) / 60;
-                      const heightPercent = Math.min(100, (hours / 24) * 100);
-                      const hasDeepDischarge = day.deepDischargeCount > 0;
-
-                      return (
-                        <div key={idx} className="bar-item">
-                          <div className="bar-fill-wrapper">
-                            <div
-                              className={`bar-fill ${hasDeepDischarge ? 'danger' : 'normal'}`}
-                              style={{ height: `${heightPercent}%` }}
-                            >
-                              <span className="bar-value">{hours > 0 ? hours.toFixed(1) + 'h' : ''}</span>
-                            </div>
-                          </div>
-                          <div className="bar-label">{day.shortDay}</div>
-                          {hasDeepDischarge && (
-                            <div className="bar-event-badge" title={`${day.deepDischargeCount} deep discharges in Manual mode`}>!</div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-              <div className="chart-footer">
-                <span>15-Min MongoDB Snapshots</span>
-                <span><strong style={{ color: 'var(--accent-red)' }}>!</strong> = Manual Deep Discharge</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* =================== TAB: CONTROLS =================== */}
-      {activeTab === 'controls' && (
-        <div className="controls-layout animate-in">
-          <div className="glass-card">
-            <h2 className="section-title">
-              <Sliders size={18} color="var(--accent-cyan)" /> System Operating Modes
-            </h2>
-            <p className="section-desc">
-              Commands are pushed instantaneously to ESP32 via MQTT. Flipping any physical switch on the ESP32 box automatically restores AUTO hardware control if offline.
-            </p>
-
-            <div className="mode-buttons-grid">
-              {[
-                { val: -1, label: 'AUTO', sub: 'Physical Switches', icon: <RefreshCw size={20} /> },
-                { val: 1, label: 'ECO', sub: 'Battery Priority', icon: <Zap size={20} color="var(--accent-cyan)" /> },
-                { val: 2, label: 'POWER CUT', sub: 'UPS Backup Mode', icon: <ShieldAlert size={20} color="var(--accent-yellow)" /> },
-                { val: 3, label: 'ECO + PCUT', sub: 'Smart Hybrid Mode', icon: <Activity size={20} color="var(--accent-blue)" /> },
-                { val: 4, label: 'MANUAL', sub: 'Direct Relay Control', icon: <Power size={20} color="var(--accent-purple)" /> },
-                { val: 0, label: 'POWER OFF', sub: 'Inverter Shutdown', icon: <Power size={20} color="var(--accent-red)" /> },
-              ].map(mode => (
-                <button
-                  key={mode.val}
-                  className={`mode-card-btn ${status?.webModeOverride === mode.val ? 'active' : ''}`}
-                  onClick={() => handleModeChange(mode.val)}
-                  disabled={loading}
-                >
-                  {mode.icon}
-                  <span>{mode.label}</span>
-                  <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 400 }}>{mode.sub}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Manual Overrides */}
-          <div className="glass-card">
-            <h2 className="section-title">
-              <Zap size={18} color="var(--accent-yellow)" /> Direct Charger & Relay Overrides
-            </h2>
-            <p className="section-desc">
-              Force SMPS charger anytime or toggle individual relays when in MANUAL mode.
-            </p>
-
-            <button
-              className={`btn-force-charge ${status?.forceChargingActive ? 'btn-force-charge-on' : 'btn-force-charge-off'}`}
-              onClick={handleForceChargeToggle}
-              disabled={loading}
-              style={{ width: '100%', justifyContent: 'center' }}
-            >
-              <Zap size={18} />
-              {status?.forceChargingActive ? 'STOP FORCE CHARGE' : 'ACTIVATE FORCE CHARGE'}
-            </button>
-
-            {status?.webModeOverride === 4 && (
-              <div className="manual-relay-btns">
-                <button
-                  className="relay-toggle-btn"
-                  onClick={() => handleRelayToggle('inverter', status?.inverterState)}
-                >
-                  {status?.inverterState ? <ToggleRight size={18} className="text-green" /> : <ToggleLeft size={18} />}
-                  Inverter Relay ({status?.inverterState ? 'ON' : 'OFF'})
-                </button>
-                <button
-                  className="relay-toggle-btn"
-                  onClick={() => handleRelayToggle('smps', status?.smpsState)}
-                >
-                  {status?.smpsState ? <ToggleRight size={18} className="text-cyan" /> : <ToggleLeft size={18} />}
-                  SMPS Charger Relay ({status?.smpsState ? 'ON' : 'OFF'})
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* =================== TAB: TIMERS =================== */}
-      {activeTab === 'timers' && (
-        <div className="timers-grid animate-in">
-          <div className="glass-card">
-            <h2 className="section-title">
-              <Clock size={18} color="var(--accent-cyan)" /> Scheduled RTC Charging
-            </h2>
-            <div className="info-item">
-              <span className="label">5:30 PM Evening Top-Up</span>
-              <span className="value" style={{ color: status?.topup530Active ? 'var(--accent-cyan)' : 'var(--text-muted)' }}>
-                {status?.topup530Active ? '⚡ ACTIVE (< 14.5V)' : 'Standby'}
-              </span>
-            </div>
-            <div className="info-item">
-              <span className="label">1:00 AM Night Top-Up</span>
-              <span className="value" style={{ color: status?.topup1amActive ? 'var(--accent-cyan)' : 'var(--text-muted)' }}>
-                {status?.topup1amActive ? '⚡ ACTIVE (< 14.5V)' : 'Standby'}
-              </span>
-            </div>
-            <div className="info-item">
-              <span className="label">Normal Low-Volt Charge</span>
-              <span className="value" style={{ color: status?.normalChargingActive ? 'var(--accent-green)' : 'var(--text-muted)' }}>
-                {status?.normalChargingActive ? '⚡ ACTIVE (≤ 12.5V)' : 'Idle'}
-              </span>
-            </div>
-            <div className="info-item">
-              <span className="label">Offline Clock Backup</span>
-              <span className="value text-green">DS3231 RTC Active</span>
-            </div>
-          </div>
-
-          <div className="glass-card">
-            <h2 className="section-title">
-              <Activity size={18} color="var(--accent-purple)" /> dV/dt Flatline Detection
-            </h2>
-            <div className="info-item">
-              <span className="label">Slope Check Interval</span>
-              <span className="value text-cyan">5 Minutes (300s)</span>
-            </div>
-            <div className="info-item">
-              <span className="label">Activation Voltage</span>
-              <span className="value">&ge; 13.5 V</span>
-            </div>
-            <div className="info-item">
-              <span className="label">Hard Stop Threshold</span>
-              <span className="value">15.5 V</span>
-            </div>
-            <div className="info-item">
-              <span className="label">Flatline Status</span>
-              <span className={`badge ${status?.flatlineDetected ? 'badge-danger' : 'badge-success'}`}>
-                {status?.flatlineDetected ? 'FLATLINE CUTOFF' : 'NORMAL SLOPE'}
-              </span>
-            </div>
-          </div>
-
-          <div className="glass-card">
-            <h2 className="section-title">
-              <Timer size={18} color="var(--accent-yellow)" /> Smart Transfer Delays
-            </h2>
-            <div className="info-item">
-              <span className="label">Grid Return Delay</span>
-              <span className="value">120s (2 Min)</span>
-            </div>
-            <div className="info-item">
-              <span className="label">Power Cut Transfer Delay</span>
-              <span className="value">120s (2 Min)</span>
-            </div>
-            <div className="info-item">
-              <span className="label">Grid Sensor Debounce</span>
-              <span className="value">1,000 ms</span>
-            </div>
-            <div className="info-item">
-              <span className="label">Offline History RAM Buffer</span>
-              <span className="value text-cyan">32 Snapshots (8 Hours)</span>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* =================== TAB: CLOUD, THRESHOLDS & OTA =================== */}
-      {activeTab === 'settings' && (
-        <div className="animate-in" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-          {/* Hosted Backend & MongoDB Cloud Config Card */}
-          <div className="glass-card">
-            <h2 className="section-title">
-              <Server size={18} color="var(--accent-cyan)" /> Hosted Backend (MQTT + MongoDB) Endpoint
-            </h2>
-            <p className="section-desc">
-              Configure the URL of your hosted Node.js Backend (e.g. Render, Railway, VPS, or <code>http://localhost:5000</code>). If unreachable, the dashboard automatically falls back to direct local LAN IP.
-            </p>
-            <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'center' }}>
-              <input
-                type="text"
-                className="ip-input"
-                style={{ flex: 1, minWidth: '240px', padding: '0.6rem 0.85rem', fontSize: '0.85rem' }}
-                value={backendUrlInput}
-                onChange={(e) => setBackendUrlInput(e.target.value)}
-                placeholder="http://localhost:5000 or https://your-api.onrender.com"
-              />
-              <button
-                className="btn-force-charge btn-force-charge-off"
-                onClick={handleSaveBackendUrl}
-              >
-                <CheckCircle2 size={16} /> Save Backend URL
+        {!demoMode && status && status.isConnected === false && (
+          <div className="banner tone-danger">
+            <AlertTriangle size={18} />
+            <span>
+              <strong>Telemetry link offline.</strong>{' '}
+              {status.error || 'ESP32 keeps running autonomous protection (BMS, timers, relays & RTC) and buffers history in RAM.'}
+            </span>
+            <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap' }}>
+              <button className="btn btn--ghost btn--sm" onClick={toggleConnection}>
+                Try {connectionMode === 'cloud' ? 'Local IP' : 'Cloud'}
+              </button>
+              <button type="button" className="btn btn--primary btn--sm" onClick={toggleDemoMode}>
+                <FlaskConical size={13} /> Preview Demo
               </button>
             </div>
           </div>
+        )}
 
-          {/* Hardware Voltage Threshold Matrix */}
-          <div className="glass-card">
-            <h2 className="section-title">
-              <Gauge size={18} color="var(--accent-green)" /> Hardware Protection & Charging Thresholds
-            </h2>
-            <div className="timers-grid">
-              <div className="info-item">
-                <span className="label">Low Battery Inverter Cutoff</span>
-                <span className="value text-red">12.0 V</span>
-              </div>
-              <div className="info-item">
-                <span className="label">Inverter Recovery / Normal Charge Start</span>
-                <span className="value text-yellow">12.5 V</span>
-              </div>
-              <div className="info-item">
-                <span className="label">dV/dt Flatline Monitor Start</span>
-                <span className="value text-cyan">13.5 V</span>
-              </div>
-              <div className="info-item">
-                <span className="label">5:30 PM & 1:00 AM Top-Up Trigger</span>
-                <span className="value text-cyan">&lt; 14.5 V</span>
-              </div>
-              <div className="info-item">
-                <span className="label">SMPS Charge Hard Cutoff (OVP Safe)</span>
-                <span className="value text-green">15.5 V</span>
-              </div>
-              <div className="info-item">
-                <span className="label">BMS Wire Fault Protection</span>
-                <span className="value text-red">&lt; 5.0 V</span>
-              </div>
-            </div>
-          </div>
+        <main key={activeTab} className="tab-enter">
+          {activeTab === 'overview' && (
+            <OverviewTab
+              status={status}
+              connected={connected}
+              batVolt={batVolt}
+              rawCurrent={rawCurrent}
+              soc={soc}
+              direction={direction}
+              inverterOnTime={inverterOnTime}
+              cellHistory={cellHistory}
+              history={history}
+              trendHistory={trendHistory}
+              chartRange={chartRange}
+              onChartRangeChange={setChartRange}
+              trendLoading={trendLoading}
+              dailyHistory={dailyHistory}
+              loading={loading}
+              onForceCharge={handleForceChargeToggle}
+              onGoControls={() => setActiveTab('controls')}
+            />
+          )}
+          {activeTab === 'controls' && (
+            <ControlsTab
+              status={status}
+              loading={loading}
+              onModeChange={handleModeChange}
+              onForceCharge={handleForceChargeToggle}
+              onRelayToggle={handleRelayToggle}
+            />
+          )}
+          {activeTab === 'timers' && <TimersTab status={status} inverterSessions={inverterSessions} />}
+          {activeTab === 'settings' && (
+            <SettingsTab
+              status={status}
+              loading={loading}
+              backendUrlInput={backendUrlInput}
+              onBackendUrlChange={setBackendUrlInput}
+              onSaveBackendUrl={handleSaveBackendUrl}
+              onOta={handleOtaTrigger}
+            />
+          )}
+          {activeTab === 'logs' && <LogsTab logs={mergedLogs} filter={logFilter} onFilterChange={setLogFilter} />}
+        </main>
 
-          {/* OTA Firmware Update Card */}
-          <div className="glass-card">
-            <h2 className="section-title">
-              <CloudLightning size={18} color="var(--accent-purple)" /> Over-The-Air (OTA) Firmware Update
-            </h2>
-            <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
-              Push an instant MQTT OTA command to download and flash the latest compiled GitHub Actions firmware binary directly to the ESP32 over Wi-Fi.
-            </p>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem' }}>
-              <div>
-                <div style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--text-main)' }}>
-                  Current Device Version: <span className="text-purple">{status?.firmwareVersion || 'v1.0.5'}</span>
-                </div>
-                <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginTop: '0.2rem' }}>
-                  Target: Latest GitHub Actions Artifact (main branch)
-                </div>
-              </div>
-              <button
-                className="btn-force-charge"
-                style={{ background: 'linear-gradient(135deg, var(--accent-purple), var(--accent-indigo))', color: '#fff' }}
-                onClick={handleOtaTrigger}
-                disabled={loading}
-              >
-                <CloudLightning size={18} />
-                {loading ? 'SENDING OTA COMMAND...' : 'INSTALL LATEST FIRMWARE (OTA)'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+        <footer className="app-footer">
+          <span>Smart Solar Off-Grid OS</span>
+          <span className="mono">{connectionMode === 'cloud' ? getBackendUrl().replace(/^https?:\/\//, '') : `LAN · ${esp32Ip}`}</span>
+        </footer>
+      </div>
 
-      {/* =================== TAB: LOGS =================== */}
-      {activeTab === 'logs' && (
-        <div className="glass-card animate-in">
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '0.85rem' }}>
-            <h2 className="section-title" style={{ marginBottom: 0 }}>
-              <FileText size={18} color="var(--accent-blue)" /> Live & MongoDB Cloud Event Stream
-            </h2>
-            <div style={{ display: 'flex', gap: '0.4rem' }}>
-              {['all', 'action', 'alert'].map(f => (
-                <button
-                  key={f}
-                  className={`badge ${logFilter === f ? 'badge-info' : ''}`}
-                  style={{ background: logFilter === f ? undefined : 'rgba(255,255,255,0.04)', color: logFilter === f ? undefined : 'var(--text-muted)' }}
-                  onClick={() => setLogFilter(f)}
-                >
-                  {f.toUpperCase()}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="log-stream-container">
-            {mergedLogs.length === 0 ? (
-              <div style={{ color: 'var(--text-muted)' }}>No events recorded yet.</div>
-            ) : (
-              mergedLogs.map(log => (
-                <div key={log.id} className="log-entry" style={{ alignItems: 'center', justifyContent: 'space-between' }}>
-                  <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                    <span className="log-time">[{log.time}]</span>
-                    <span className={`badge ${log.type === 'danger' ? 'badge-danger' : log.type === 'warning' ? 'badge-warning' : log.type === 'success' ? 'badge-success' : 'badge-info'}`} style={{ padding: '0.08rem 0.4rem', fontSize: '0.6rem' }}>
-                      {log.source === 'mongodb' ? 'DB' : 'UI'}
-                    </span>
-                    <span className="log-msg">{log.msg}</span>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* =================== MOBILE BOTTOM NAVIGATION BAR =================== */}
-      <nav className="mobile-bottom-nav" aria-label="Mobile Navigation">
-        {tabs.map(tab => (
+      <nav className="mobile-nav" aria-label="Mobile navigation">
+        {TABS.map(tab => (
           <button
             key={tab.id}
-            className={`mobile-nav-btn ${activeTab === tab.id ? 'active' : ''}`}
+            className={`mobile-nav-btn ${activeTab === tab.id ? 'is-active' : ''}`}
             onClick={() => setActiveTab(tab.id)}
+            aria-current={activeTab === tab.id ? 'page' : undefined}
           >
             {tab.icon}
             <span>{tab.mobileLabel}</span>
           </button>
         ))}
       </nav>
+
+      <ConfirmDialog
+        open={!!confirm}
+        title={confirm?.title}
+        message={confirm?.message}
+        confirmLabel={confirm?.confirmLabel}
+        tone={confirm?.tone}
+        onCancel={() => setConfirm(null)}
+        onConfirm={() => { const fn = confirm?.onConfirm; setConfirm(null); fn?.(); }}
+      />
+      <ToastStack toasts={toasts} onDismiss={(id) => setToasts(prev => prev.filter(t => t.id !== id))} />
     </div>
   );
 }

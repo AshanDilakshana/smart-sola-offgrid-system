@@ -31,7 +31,11 @@ const MQTT_CA_PATH = process.env.MQTT_CA_PATH || './certs/AmazonRootCA1.pem';
 const MQTT_CERT_PATH = process.env.MQTT_CERT_PATH || './certs/403442dcb14e0a38ef4fc1b65681a0dff9775afdd14f900e2d1cea114d3fefa1-certificate.pem.crt';
 const MQTT_KEY_PATH = process.env.MQTT_KEY_PATH || './certs/403442dcb14e0a38ef4fc1b65681a0dff9775afdd14f900e2d1cea114d3fefa1-private.pem.key';
 const TOPIC_PREFIX = process.env.MQTT_TOPIC_PREFIX || 'ashan_smart_offgrid_v1';
-const HISTORY_INTERVAL_MS = (Number(process.env.HISTORY_LOG_INTERVAL_MINUTES) || 15) * 60 * 1000;
+const IDLE_INTERVAL_MIN = Number(process.env.HISTORY_IDLE_INTERVAL_MINUTES || process.env.HISTORY_LOG_INTERVAL_MINUTES) || 15;
+const CHARGE_INTERVAL_MIN = Number(process.env.HISTORY_CHARGE_INTERVAL_MINUTES) || 5;
+const DISCHARGE_INTERVAL_MIN = Number(process.env.HISTORY_DISCHARGE_INTERVAL_MINUTES) || 2;
+const RETENTION_DAYS = Number(process.env.RETENTION_DAYS) || 60;
+const MIN_TRANSITION_SAVE_GAP_MS = 15000;
 
 const TOPICS = {
   STATUS: `${TOPIC_PREFIX}/status`,
@@ -48,6 +52,8 @@ let mqttConnected = false;
 let deviceOnline = false;
 let lastSeenTimestamp = 0;
 let lastHistorySavedAt = 0;
+let lastSavedPhase = null;
+let lastSavedVoltage = null;
 let lastStateDbSyncAt = 0;
 let lastHeartbeatForwardedAt = 0;
 
@@ -66,7 +72,128 @@ let currentCommands = {
 // In-memory ring buffers if MongoDB is not configured or temporarily offline
 const inMemoryHistory = [];
 const inMemoryEvents = [];
-const MAX_IN_MEMORY_HISTORY = 700; // ~7 days of 15-min intervals
+const MAX_IN_MEMORY_HISTORY = 2000;
+
+function getTelemetryPhase(data) {
+  const current = Number(data?.batteryCurrent ?? 0);
+  if (current > 0.05 || Boolean(data?.inverterState)) return 'discharging';
+  if (current < -0.05) return 'charging';
+  return 'idle';
+}
+
+function getIntervalMsForPhase(phase) {
+  if (phase === 'discharging') return DISCHARGE_INTERVAL_MIN * 60 * 1000;
+  if (phase === 'charging') return CHARGE_INTERVAL_MIN * 60 * 1000;
+  return IDLE_INTERVAL_MIN * 60 * 1000;
+}
+
+function downsampleMinMax(rows, maxPoints) {
+  if (!Array.isArray(rows) || rows.length <= maxPoints || maxPoints < 4) {
+    return rows || [];
+  }
+
+  const result = [rows[0]];
+  const interior = rows.slice(1, -1);
+  const bucketCount = Math.max(1, Math.floor((maxPoints - 2) / 2));
+  const bucketSize = interior.length / bucketCount;
+
+  for (let b = 0; b < bucketCount; b++) {
+    const start = Math.floor(b * bucketSize);
+    const end = Math.min(interior.length, Math.floor((b + 1) * bucketSize));
+    if (start >= end) continue;
+
+    let minIdx = start;
+    let maxIdx = start;
+    for (let i = start + 1; i < end; i++) {
+      const v = Number(interior[i].batteryVoltage ?? 0);
+      if (v < Number(interior[minIdx].batteryVoltage ?? 0)) minIdx = i;
+      if (v > Number(interior[maxIdx].batteryVoltage ?? 0)) maxIdx = i;
+    }
+
+    if (minIdx === maxIdx) {
+      result.push(interior[minIdx]);
+    } else if (minIdx < maxIdx) {
+      result.push(interior[minIdx], interior[maxIdx]);
+    } else {
+      result.push(interior[maxIdx], interior[minIdx]);
+    }
+  }
+
+  result.push(rows[rows.length - 1]);
+  return result;
+}
+
+const WEEKDAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function formatLocalDayMeta(epochSec, tzOffsetMin = 0) {
+  const localDate = new Date(epochSec * 1000 - tzOffsetMin * 60 * 1000);
+  const y = localDate.getUTCFullYear();
+  const m = localDate.getUTCMonth();
+  const d = localDate.getUTCDate();
+  const wd = localDate.getUTCDay();
+  const dateKey = `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  return {
+    dateKey,
+    dateStr: `${MONTH_NAMES[m]} ${d}, ${y}`,
+    shortDay: WEEKDAY_NAMES[wd]
+  };
+}
+
+function buildDailyUptime(rows, days = 7, tzOffsetMin = 0) {
+  const dailyMap = new Map();
+  let inDeepDischarge = false;
+
+  for (let i = 0; i < rows.length; i++) {
+    const curr = rows[i];
+    const meta = formatLocalDayMeta(curr.epoch, tzOffsetMin);
+    if (!dailyMap.has(meta.dateKey)) {
+      dailyMap.set(meta.dateKey, {
+        dateKey: meta.dateKey,
+        dateStr: meta.dateStr,
+        shortDay: meta.shortDay,
+        uptimeSec: 0,
+        deepDischargeCount: 0,
+        minVoltage: Number(curr.batteryVoltage),
+        maxVoltage: Number(curr.batteryVoltage)
+      });
+    }
+
+    const bucket = dailyMap.get(meta.dateKey);
+    const v = Number(curr.batteryVoltage ?? 0);
+    if (v > 1) {
+      bucket.minVoltage = Math.min(bucket.minVoltage, v);
+      bucket.maxVoltage = Math.max(bucket.maxVoltage, v);
+    }
+
+    const dtSec = i < rows.length - 1
+      ? Math.min(Math.max(Number(rows[i + 1].epoch) - Number(curr.epoch), 0), 30 * 60)
+      : (curr.inverterState || curr.phase === 'discharging' ? 120 : 900);
+
+    if (curr.inverterState) {
+      bucket.uptimeSec += dtSec;
+    }
+
+    const isDeep = Boolean(curr.inverterState)
+      && (curr.mode === 'MANUAL' || curr.modeString === 'MANUAL')
+      && v > 1
+      && v <= 12.5;
+    if (isDeep && !inDeepDischarge) {
+      bucket.deepDischargeCount += 1;
+    }
+    inDeepDischarge = isDeep;
+  }
+
+  return Array.from(dailyMap.values())
+    .sort((a, b) => a.dateKey.localeCompare(b.dateKey))
+    .slice(-days)
+    .map(({ uptimeSec, minVoltage, maxVoltage, ...rest }) => ({
+      ...rest,
+      uptimeHours: Number((uptimeSec / 3600).toFixed(2)),
+      minVoltage: Number.isFinite(minVoltage) ? Number(minVoltage.toFixed(2)) : null,
+      maxVoltage: Number.isFinite(maxVoltage) ? Number(maxVoltage.toFixed(2)) : null
+    }));
+}
 
 // Connected SSE Clients for instant real-time frontend push
 const sseClients = new Set();
@@ -79,6 +206,32 @@ function broadcastSSE(eventType, payload) {
     } catch (err) {
       sseClients.delete(client);
     }
+  }
+}
+
+async function pruneExpiredRecords() {
+  const cutoffEpoch = Math.floor(Date.now() / 1000) - RETENTION_DAYS * 86400;
+
+  while (inMemoryHistory.length > 0 && inMemoryHistory[0].epoch < cutoffEpoch) {
+    inMemoryHistory.shift();
+  }
+  for (let i = inMemoryEvents.length - 1; i >= 0; i--) {
+    if (inMemoryEvents[i].epoch < cutoffEpoch) {
+      inMemoryEvents.splice(i, 1);
+    }
+  }
+
+  if (!mongoConnected) return;
+  try {
+    const [histRes, eventRes] = await Promise.all([
+      HistoryLog.deleteMany({ epoch: { $lt: cutoffEpoch } }),
+      EventLog.deleteMany({ epoch: { $lt: cutoffEpoch } })
+    ]);
+    if (histRes.deletedCount > 0 || eventRes.deletedCount > 0) {
+      console.log(`[Retention] Pruned ${histRes.deletedCount} history & ${eventRes.deletedCount} event records older than ${RETENTION_DAYS}d`);
+    }
+  } catch (err) {
+    console.warn('[Retention] Cleanup error:', err.message);
   }
 }
 
@@ -97,6 +250,10 @@ async function connectMongoDB() {
     });
     mongoConnected = true;
     console.log('[MongoDB] Connected successfully');
+
+    HistoryLog.createIndexes().catch(() => {});
+    EventLog.createIndexes().catch(() => {});
+    pruneExpiredRecords();
 
     // Load last persisted state from MongoDB on startup
     const savedState = await SystemState.findOne({ deviceId: 'esp32_main' }).lean();
@@ -117,6 +274,8 @@ async function connectMongoDB() {
     setTimeout(connectMongoDB, 15000);
   }
 }
+
+setInterval(pruneExpiredRecords, 6 * 60 * 60 * 1000);
 
 mongoose.connection.on('disconnected', () => {
   mongoConnected = false;
@@ -139,7 +298,10 @@ async function saveHistorySnapshot(snapshot, syncedFromOffline = false) {
     inverterState: Boolean(snapshot.inverterState),
     smpsState: Boolean(snapshot.smpsState),
     mode: snapshot.mode || snapshot.modeString || 'POWER OFF',
-    syncedFromOfflineBuffer: syncedFromOffline
+    syncedFromOfflineBuffer: syncedFromOffline,
+    phase: snapshot.phase || getTelemetryPhase(snapshot),
+    source: snapshot.source || (syncedFromOffline ? 'offline-buffer' : 'esp32'),
+    recordedAt: new Date(epoch * 1000)
   };
 
   // Update in-memory fallback list (deduplicate by epoch)
@@ -167,17 +329,21 @@ async function saveHistorySnapshot(snapshot, syncedFromOffline = false) {
   }
 }
 
-async function logSystemEvent(eventText, type = 'info', details = {}) {
+async function logSystemEvent(eventText, type = 'info', details = {}, source = 'system', customEpoch) {
+  const epoch = Number(customEpoch) || Math.floor(Date.now() / 1000);
+  const recordedAt = new Date(epoch * 1000);
   const entry = {
-    epoch: Math.floor(Date.now() / 1000),
+    epoch,
     type,
     event: eventText,
     details,
-    createdAt: new Date().toISOString()
+    source,
+    recordedAt,
+    createdAt: recordedAt.toISOString()
   };
 
   inMemoryEvents.unshift(entry);
-  if (inMemoryEvents.length > 100) inMemoryEvents.pop();
+  if (inMemoryEvents.length > 200) inMemoryEvents.pop();
 
   broadcastSSE('event', entry);
 
@@ -188,6 +354,13 @@ async function logSystemEvent(eventText, type = 'info', details = {}) {
       console.error('[MongoDB] Failed to save event log:', err.message);
     }
   }
+}
+
+function computeCellSpread(cells) {
+  if (!Array.isArray(cells)) return 0;
+  const valid = cells.map(Number).filter(v => v > 1.0);
+  if (valid.length < 2) return 0;
+  return Math.max(...valid) - Math.min(...valid);
 }
 
 async function detectAndLogTransitions(prev, curr) {
@@ -226,6 +399,22 @@ async function detectAndLogTransitions(prev, curr) {
       'dV/dt Flatline Detected — Battery full, stopping charge',
       'success',
       { batteryVoltage: curr.batteryVoltage }
+    );
+  }
+  if (Number(prev.batteryVoltage) > 12.2 && Number(curr.batteryVoltage) <= 12.2 && Number(curr.batteryVoltage) > 5.0) {
+    await logSystemEvent(
+      `Low Battery Voltage Alert (${Number(curr.batteryVoltage).toFixed(2)} V)`,
+      'danger',
+      { batteryVoltage: curr.batteryVoltage, batterySoc: curr.batterySoc }
+    );
+  }
+  const prevSpread = computeCellSpread(prev.cellVoltages);
+  const currSpread = computeCellSpread(curr.cellVoltages);
+  if (prevSpread < 0.08 && currSpread >= 0.08) {
+    await logSystemEvent(
+      `4S Cell Imbalance Alert (ΔV ${(currSpread * 1000).toFixed(0)} mV)`,
+      'warning',
+      { cellVoltages: curr.cellVoltages }
     );
   }
 }
@@ -318,7 +507,8 @@ mqttClient.on('message', async (topic, messageBuffer) => {
       deviceOnline = true;
       lastSeenTimestamp = Date.now();
 
-      await detectAndLogTransitions(prevStatusForEvents, data);
+      const prevSnap = prevStatusForEvents;
+      await detectAndLogTransitions(prevSnap, data);
       prevStatusForEvents = { ...data };
       liveStatus = {
         ...data,
@@ -331,25 +521,49 @@ mqttClient.on('message', async (topic, messageBuffer) => {
       // Push immediately to any open React dashboard via SSE
       broadcastSSE('status', liveStatus);
 
-      // Automatic 15-minute History Logging to MongoDB (only when valid BMS voltage > 5.0V)
+      // Adaptive MongoDB History Logging (15m idle, 5m charging, 2m discharging, + key transitions)
       const now = Date.now();
-      if (Number(data.batteryVoltage) > 5.0 && (lastHistorySavedAt === 0 || now - lastHistorySavedAt >= HISTORY_INTERVAL_MS)) {
-        lastHistorySavedAt = now;
-        await saveHistorySnapshot(
-          {
-            epoch: data.epoch || Math.floor(now / 1000),
-            batteryVoltage: data.batteryVoltage,
-            batteryCurrent: data.batteryCurrent,
-            batterySoc: data.batterySoc,
-            cellVoltages: data.cellVoltages,
-            solarVoltage: data.solarVoltage,
-            gridPresent: data.gridPresent,
-            inverterState: data.inverterState,
-            smpsState: data.smpsState,
-            mode: data.modeString
-          },
-          false
+      const batVolt = Number(data.batteryVoltage);
+      if (batVolt > 5.0) {
+        const phase = getTelemetryPhase(data);
+        const requiredIntervalMs = getIntervalMsForPhase(phase);
+        const phaseChanged = lastSavedPhase !== null && lastSavedPhase !== phase;
+        const relayOrGridChanged = Boolean(
+          prevSnap && (
+            prevSnap.gridPresent !== data.gridPresent
+            || prevSnap.inverterState !== data.inverterState
+            || prevSnap.smpsState !== data.smpsState
+            || prevSnap.modeString !== data.modeString
+          )
         );
+        const voltageJump = lastSavedVoltage !== null && Math.abs(batVolt - lastSavedVoltage) >= 0.35;
+
+        const shouldSave = lastHistorySavedAt === 0
+          || (now - lastHistorySavedAt >= requiredIntervalMs)
+          || ((phaseChanged || relayOrGridChanged || voltageJump) && (now - lastHistorySavedAt >= MIN_TRANSITION_SAVE_GAP_MS));
+
+        if (shouldSave) {
+          lastHistorySavedAt = now;
+          lastSavedPhase = phase;
+          lastSavedVoltage = batVolt;
+          await saveHistorySnapshot(
+            {
+              epoch: data.epoch || Math.floor(now / 1000),
+              batteryVoltage: data.batteryVoltage,
+              batteryCurrent: data.batteryCurrent,
+              batterySoc: data.batterySoc,
+              cellVoltages: data.cellVoltages,
+              solarVoltage: data.solarVoltage,
+              gridPresent: data.gridPresent,
+              inverterState: data.inverterState,
+              smpsState: data.smpsState,
+              mode: data.modeString,
+              phase,
+              source: 'esp32'
+            },
+            false
+          );
+        }
       }
 
       // Persist latest status to MongoDB SystemState (throttled to every 30s)
@@ -430,7 +644,13 @@ app.get('/api/health', (req, res) => {
     mongoConnected,
     deviceOnline,
     lastSeen: lastSeenTimestamp,
-    topicPrefix: TOPIC_PREFIX
+    topicPrefix: TOPIC_PREFIX,
+    storagePolicy: {
+      idleIntervalMin: IDLE_INTERVAL_MIN,
+      chargeIntervalMin: CHARGE_INTERVAL_MIN,
+      dischargeIntervalMin: DISCHARGE_INTERVAL_MIN,
+      retentionDays: RETENTION_DAYS
+    }
   });
 });
 
@@ -594,18 +814,35 @@ const handleOtaRoute = async (req, res) => {
 app.post('/api/ota-update', handleOtaRoute);
 app.get('/api/ota-update', handleOtaRoute);
 
-// Fetch 7-Day (or custom days) History from MongoDB
+// Fetch History from MongoDB with min/max downsampling for multi-day trends
 app.get('/api/history', async (req, res) => {
-  const days = Number(req.query.days) || 7;
+  const days = Math.min(RETENTION_DAYS, Math.max(1, Number(req.query.days) || 7));
+  const maxPoints = Math.min(2000, Math.max(50, Number(req.query.maxPoints) || 500));
+  const raw = req.query.raw === 'true';
   const minEpoch = Math.floor(Date.now() / 1000) - days * 86400;
 
   if (mongoConnected) {
     try {
-      const logs = await HistoryLog.find({ epoch: { $gte: minEpoch } })
+      const rows = await HistoryLog.find({ epoch: { $gte: minEpoch } })
         .sort({ epoch: 1 })
-        .limit(2000)
+        .select({
+          _id: 0,
+          epoch: 1,
+          time: 1,
+          batteryVoltage: 1,
+          batteryCurrent: 1,
+          batterySoc: 1,
+          cellVoltages: 1,
+          solarVoltage: 1,
+          gridPresent: 1,
+          inverterState: 1,
+          smpsState: 1,
+          mode: 1,
+          phase: 1
+        })
+        .limit(45000)
         .lean();
-      return res.json(logs);
+      return res.json(raw ? rows : downsampleMinMax(rows, maxPoints));
     } catch (err) {
       console.error('[MongoDB] History query error:', err.message);
     }
@@ -613,20 +850,65 @@ app.get('/api/history', async (req, res) => {
 
   // Fallback to in-memory history if MongoDB is not connected
   const filtered = inMemoryHistory.filter(h => h.epoch >= minEpoch);
-  res.json(filtered);
+  res.json(raw ? filtered : downsampleMinMax(filtered, maxPoints));
+});
+
+// Daily Inverter Uptime & Deep-Discharge Summary
+app.get('/api/history/daily', async (req, res) => {
+  const days = Math.min(RETENTION_DAYS, Math.max(1, Number(req.query.days) || 7));
+  const tzOffsetMin = Number(req.query.tzOffsetMin) || 0;
+  const minEpoch = Math.floor(Date.now() / 1000) - days * 86400;
+
+  if (mongoConnected) {
+    try {
+      const rows = await HistoryLog.find({ epoch: { $gte: minEpoch } })
+        .sort({ epoch: 1 })
+        .select({ _id: 0, epoch: 1, batteryVoltage: 1, inverterState: 1, mode: 1, phase: 1 })
+        .limit(45000)
+        .lean();
+      return res.json(buildDailyUptime(rows, days, tzOffsetMin));
+    } catch (err) {
+      console.error('[MongoDB] Daily uptime query error:', err.message);
+    }
+  }
+
+  const filtered = inMemoryHistory.filter(h => h.epoch >= minEpoch);
+  res.json(buildDailyUptime(filtered, days, tzOffsetMin));
+});
+
+// Persist Event Log from Dashboard UI
+const ALLOWED_EVENT_TYPES = new Set(['info', 'action', 'warning', 'danger', 'success']);
+app.post('/api/events', async (req, res) => {
+  const rawEvent = typeof req.body?.event === 'string' ? req.body.event.trim() : '';
+  if (!rawEvent) {
+    return res.status(400).json({ error: 'Missing event description' });
+  }
+  const cleanEvent = rawEvent.slice(0, 240);
+  const cleanType = ALLOWED_EVENT_TYPES.has(req.body?.type) ? req.body.type : 'info';
+  const details = req.body?.details && typeof req.body.details === 'object' ? req.body.details : {};
+
+  await logSystemEvent(cleanEvent, cleanType, details, 'ui');
+  res.json({ success: true });
 });
 
 // Fetch Event Logs from MongoDB
 app.get('/api/events', async (req, res) => {
+  const days = Math.min(RETENTION_DAYS, Math.max(1, Number(req.query.days) || RETENTION_DAYS));
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 150));
+  const minEpoch = Math.floor(Date.now() / 1000) - days * 86400;
+
   if (mongoConnected) {
     try {
-      const events = await EventLog.find().sort({ epoch: -1 }).limit(100).lean();
+      const events = await EventLog.find({ epoch: { $gte: minEpoch } })
+        .sort({ epoch: -1 })
+        .limit(limit)
+        .lean();
       return res.json(events);
     } catch (err) {
       console.error('[MongoDB] Events query error:', err.message);
     }
   }
-  res.json(inMemoryEvents);
+  res.json(inMemoryEvents.filter(e => e.epoch >= minEpoch).slice(0, limit));
 });
 
 // Start Server
