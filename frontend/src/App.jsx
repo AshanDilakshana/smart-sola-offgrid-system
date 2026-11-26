@@ -613,8 +613,8 @@ export default function App() {
                   <div className="battery-metric-val">
                     {liveWatts}<span className="unit">W</span>
                   </div>
-                  <span className="battery-metric-sub" style={{ color: batCurrent > 0.05 ? 'var(--accent-green)' : batCurrent < -0.05 ? 'var(--accent-orange)' : 'var(--text-muted)' }}>
-                    {batCurrent > 0.05 ? '▲ Charging Flow' : batCurrent < -0.05 ? '▼ Load Discharge' : '• Standby Idle'}
+                  <span className="battery-metric-sub" style={{ color: batCurrent < -0.05 ? 'var(--accent-green)' : batCurrent > 0.05 ? 'var(--accent-orange)' : 'var(--text-muted)' }}>
+                    {batCurrent < -0.05 ? '▲ Charging Flow' : batCurrent > 0.05 ? '▼ Load Discharge' : '• Standby Idle'}
                   </span>
                 </div>
 
@@ -637,8 +637,8 @@ export default function App() {
                     <RefreshCw size={11} className="spin" /> SMPS Active
                   </span>
                 )}
-                <span className={`badge ${status?.smpsState || batCurrent > 0.05 ? 'badge-info' : soc > 30 ? 'badge-success' : 'badge-danger'}`}>
-                  {status?.smpsState || batCurrent > 0.05 ? '⚡ Charging Bank' : soc > 30 ? '✓ Bank Healthy' : '⚠ Bank Low'}
+                <span className={`badge ${status?.smpsState || batCurrent < -0.05 ? 'badge-info' : soc > 30 ? 'badge-success' : 'badge-danger'}`}>
+                  {status?.smpsState || batCurrent < -0.05 ? '⚡ Charging Bank' : soc > 30 ? '✓ Bank Healthy' : '⚠ Bank Low'}
                 </span>
                 {status?.forceChargingActive && (
                   <span className="badge badge-warning">Force Charge ON</span>
@@ -713,7 +713,7 @@ export default function App() {
                   <circle
                     cx="100" cy="100" r={radius}
                     fill="none"
-                    stroke={batCurrent > 0.05 ? 'url(#greenGrad)' : batCurrent < -0.05 ? 'url(#redGrad)' : 'url(#cyanGrad)'}
+                    stroke={batCurrent < -0.05 ? 'url(#greenGrad)' : batCurrent > 0.05 ? 'url(#redGrad)' : 'url(#cyanGrad)'}
                     strokeWidth="14"
                     strokeDasharray={`${circumference * 0.75} ${circumference * 0.25}`}
                     strokeDashoffset={circumference * 0.75 - ((circumference * 0.75) * Math.min(100, (Math.abs(batCurrent) / 30) * 100)) / 100}
@@ -723,11 +723,11 @@ export default function App() {
                   />
                 </svg>
                 <div className="svg-gauge-text">
-                  <div className="svg-gauge-val" style={{ color: batCurrent > 0.05 ? 'var(--accent-green)' : batCurrent < -0.05 ? 'var(--accent-red)' : 'var(--accent-cyan)' }}>
+                  <div className="svg-gauge-val" style={{ color: batCurrent < -0.05 ? 'var(--accent-green)' : batCurrent > 0.05 ? 'var(--accent-red)' : 'var(--accent-cyan)' }}>
                     {Math.abs(batCurrent).toFixed(1)}<span>A</span>
                   </div>
-                  <div className="svg-gauge-sub" style={{ color: batCurrent > 0.05 ? 'var(--accent-green)' : batCurrent < -0.05 ? 'var(--accent-red)' : 'var(--text-muted)' }}>
-                    {batCurrent > 0.05 ? 'Charging Amps' : batCurrent < -0.05 ? 'Discharge Amps' : 'Idle Amps'}
+                  <div className="svg-gauge-sub" style={{ color: batCurrent < -0.05 ? 'var(--accent-green)' : batCurrent > 0.05 ? 'var(--accent-red)' : 'var(--text-muted)' }}>
+                    {batCurrent < -0.05 ? 'Charging Amps' : batCurrent > 0.05 ? 'Discharge Amps' : 'Idle Amps'}
                   </div>
                 </div>
               </div>
@@ -861,7 +861,7 @@ export default function App() {
               <div className="card-value" style={{ color: status?.gridPresent ? 'var(--accent-green)' : 'var(--accent-red)' }}>
                 {status?.gridPresent ? 'ONLINE' : 'POWER CUT'}
               </div>
-              <div className="card-subtitle">1,000ms noise debounce &bull; 180s transfer delay</div>
+              <div className="card-subtitle">1,000ms noise debounce &bull; 120s transfer delay</div>
             </div>
 
             {/* Solar PV */}
@@ -1080,11 +1080,11 @@ export default function App() {
             </h2>
             <div className="info-item">
               <span className="label">Grid Return Delay</span>
-              <span className="value">180s (3 Min)</span>
+              <span className="value">120s (2 Min)</span>
             </div>
             <div className="info-item">
               <span className="label">Power Cut Transfer Delay</span>
-              <span className="value">180s (3 Min)</span>
+              <span className="value">120s (2 Min)</span>
             </div>
             <div className="info-item">
               <span className="label">Grid Sensor Debounce</span>

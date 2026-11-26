@@ -331,9 +331,9 @@ mqttClient.on('message', async (topic, messageBuffer) => {
       // Push immediately to any open React dashboard via SSE
       broadcastSSE('status', liveStatus);
 
-      // Automatic 15-minute History Logging to MongoDB (offloads ESP32!)
+      // Automatic 15-minute History Logging to MongoDB (only when valid BMS voltage > 5.0V)
       const now = Date.now();
-      if (lastHistorySavedAt === 0 || now - lastHistorySavedAt >= HISTORY_INTERVAL_MS) {
+      if (Number(data.batteryVoltage) > 5.0 && (lastHistorySavedAt === 0 || now - lastHistorySavedAt >= HISTORY_INTERVAL_MS)) {
         lastHistorySavedAt = now;
         await saveHistorySnapshot(
           {
@@ -393,12 +393,12 @@ mqttClient.on('message', async (topic, messageBuffer) => {
   }
 });
 
-// Helper to publish commands to ESP32 via MQTT
-function publishCommandToEsp32(cmdPatch, retain = false) {
+// Helper to publish commands to ESP32 via MQTT (retain: false for AWS IoT Core & physical switch safety)
+function publishCommandToEsp32(cmdPatch) {
   currentCommands = { ...currentCommands, ...cmdPatch };
 
   if (mqttConnected) {
-    mqttClient.publish(TOPICS.COMMANDS, JSON.stringify(cmdPatch), { qos: 1, retain });
+    mqttClient.publish(TOPICS.COMMANDS, JSON.stringify(cmdPatch), { qos: 1, retain: false });
   }
 
   if (mongoConnected) {

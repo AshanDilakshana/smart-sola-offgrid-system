@@ -72,8 +72,8 @@ const int MANUAL_SWITCH = 13;
 
 
 // --- Easy Timer Configuration ---
-const unsigned long TIMER_DELAY_MS = 180000; 
-const int TIMER_DELAY_SEC = 180;
+const unsigned long TIMER_DELAY_MS = 120000; 
+const int TIMER_DELAY_SEC = 120;
 
 // --- Charging Voltage Configuration ---
 const float BAT_CHARGE_START_THRESHOLD = 12.5; // Start normal charging below this voltage (Default: 12.5V)
@@ -501,8 +501,8 @@ void syncFirebaseTask(void * pvParameters) {
   for (;;) {
     unsigned long now = millis();
 
-    // 1. Periodic 15-Minute History Snapshot Recording (Works Online AND Offline!)
-    if (lastHistoryLogTime == 0 || (now - lastHistoryLogTime >= HISTORY_LOG_INTERVAL)) {
+    // 1. Periodic 15-Minute History Snapshot Recording (Works Online AND Offline once BMS data is valid!)
+    if (jkbms.dataValid && lastBatVolt > 5.0 && (lastHistoryLogTime == 0 || (now - lastHistoryLogTime >= HISTORY_LOG_INTERVAL))) {
       lastHistoryLogTime = now;
       enqueueOfflineHistory();
     }
@@ -547,23 +547,23 @@ void syncFirebaseTask(void * pvParameters) {
             mqtt_user,
             mqtt_pass,
             TOPIC_AVAILABILITY,
-            1,
-            true,
+            0,
+            false,
             "offline"
           );
         } else {
           connected = mqttClient.connect(
             clientId.c_str(),
             TOPIC_AVAILABILITY,
-            1,
-            true,
+            0,
+            false,
             "offline"
           );
         }
 
         if (connected) {
           Serial.println("MQTT Connected! Publishing online availability & subscribing...");
-          mqttClient.publish(TOPIC_AVAILABILITY, "online", true);
+          mqttClient.publish(TOPIC_AVAILABILITY, "online", false);
           mqttClient.subscribe(TOPIC_COMMANDS, 1);
           forceImmediatePublish = true;
         }
@@ -833,13 +833,42 @@ void loop() {
     topup1amDone = false;
   }
 
-  // Auto safety cutoff for force charging if battery reaches stop threshold
-  if (forceChargingActive && batVolt >= BAT_CHARGE_STOP_THRESHOLD) {
+  // Auto safety cutoff for force charging if fault exists or battery reaches stop threshold
+  if (forceChargingActive && (errorString != "" || inverterState || batVolt >= BAT_CHARGE_STOP_THRESHOLD)) {
     forceChargingActive = false;
+  }
+
+  // --- Flatline Detection Logic (Runs for all charging modes including Force Charge) ---
+  if ((errorString == "") && (forceChargingActive || topup530Active || topup1amActive || normalChargingActive)) {
+    if (batVolt >= DVDT_START_VOLTAGE) {
+      if (lastRecordedVoltage == 0.0) {
+        lastRecordedVoltage = batVolt;
+        lastVoltageCheckTime = millis();
+        flatlineDetected = false;
+      } else {
+        if (millis() - lastVoltageCheckTime >= VOLTAGE_CHECK_INTERVAL) {
+          if (batVolt <= lastRecordedVoltage) {
+            flatlineDetected = true; 
+          }
+          lastRecordedVoltage = batVolt;
+          lastVoltageCheckTime = millis();
+        }
+      }
+    } else {
+      lastRecordedVoltage = 0.0;
+      flatlineDetected = false;
+    }
+  } else {
+    lastRecordedVoltage = 0.0;
+    flatlineDetected = false;
   }
 
   if (forceChargingActive) {
     smpsState = true;
+    if (batVolt >= BAT_CHARGE_STOP_THRESHOLD || flatlineDetected) {
+      forceChargingActive = false;
+      smpsState = false;
+    }
   }
   else if (allowCharging) {
     
@@ -858,31 +887,6 @@ void loop() {
       normalChargingActive = true;
     }
 
-
-    // --- Flatline Detection Logic ---
-    if (topup530Active || topup1amActive || normalChargingActive) {
-      if (batVolt >= DVDT_START_VOLTAGE) {
-        if (lastRecordedVoltage == 0.0) {
-          lastRecordedVoltage = batVolt;
-          lastVoltageCheckTime = millis();
-          flatlineDetected = false;
-        } else {
-          if (millis() - lastVoltageCheckTime >= VOLTAGE_CHECK_INTERVAL) {
-            if (batVolt <= lastRecordedVoltage) {
-              flatlineDetected = true; 
-            }
-            lastRecordedVoltage = batVolt;
-            lastVoltageCheckTime = millis();
-          }
-        }
-      } else {
-        lastRecordedVoltage = 0.0;
-        flatlineDetected = false;
-      }
-    } else {
-      lastRecordedVoltage = 0.0;
-      flatlineDetected = false;
-    }
     // --- SMPS STATE EVALUATION & OFF CONDITIONS ---
     if (topup530Active) {
       smpsState = true;

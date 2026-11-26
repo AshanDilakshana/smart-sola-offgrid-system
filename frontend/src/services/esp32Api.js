@@ -1,10 +1,11 @@
 // ESP32 API Service — Hosted Node.js Backend (MQTT + MongoDB + SSE Stream) & Local LAN Offline Fallback
 
-const DEFAULT_BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
+const DEFAULT_BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'https://smart-sola-offgrid-system.onrender.com';
 
 export function getBackendUrl() {
   if (typeof window !== 'undefined') {
-    return localStorage.getItem('smart_offgrid_backend_url') || DEFAULT_BACKEND_URL;
+    const saved = localStorage.getItem('smart_offgrid_backend_url');
+    if (saved && saved !== 'http://localhost:5000') return saved;
   }
   return DEFAULT_BACKEND_URL;
 }
