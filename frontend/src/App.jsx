@@ -30,7 +30,10 @@ import {
   Cpu,
   CheckCircle2,
   ArrowRight,
-  Gauge
+  Gauge,
+  Download,
+  Smartphone,
+  X
 } from 'lucide-react';
 import {
   fetchSystemStatus,
@@ -57,6 +60,18 @@ export default function App() {
   const [logFilter, setLogFilter] = useState('all');
   const [dailyHistory, setDailyHistory] = useState([]);
 
+  // PWA Install State
+  const [deferredPrompt, setDeferredPrompt] = useState(null);
+  const [isStandalone, setIsStandalone] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+  });
+  const [isIos] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return /iphone|ipad|ipod/i.test(window.navigator.userAgent);
+  });
+  const [showIosInstallTip, setShowIosInstallTip] = useState(false);
+
   // Inverter uptime tracking
   const [inverterOnTime, setInverterOnTime] = useState(0);
   const [inverterSessions, setInverterSessions] = useState([]);
@@ -72,6 +87,37 @@ export default function App() {
   useEffect(() => {
     addLog('System initialized — MQTT + MongoDB Cloud Console active.', 'info');
   }, []);
+
+  useEffect(() => {
+    const handleBeforeInstallPrompt = (e) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+    };
+
+    const handleAppInstalled = () => {
+      setIsStandalone(true);
+      setDeferredPrompt(null);
+      setShowIosInstallTip(false);
+      addLog('App installed on device home screen.', 'success');
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    window.addEventListener('appinstalled', handleAppInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+      window.removeEventListener('appinstalled', handleAppInstalled);
+    };
+  }, []);
+
+  const handleInstallApp = async () => {
+    if (deferredPrompt) {
+      deferredPrompt.prompt();
+      await deferredPrompt.userChoice;
+      setDeferredPrompt(null);
+    } else if (isIos && !isStandalone) {
+      setShowIosInstallTip(prev => !prev);
+    }
+  };
 
   useEffect(() => {
     let isMounted = true;
@@ -322,11 +368,11 @@ export default function App() {
   };
 
   const tabs = [
-    { id: 'overview', label: 'Overview', icon: <Activity size={16} /> },
-    { id: 'controls', label: 'Controls', icon: <Sliders size={16} /> },
-    { id: 'timers', label: 'Timers & Logic', icon: <Clock size={16} /> },
-    { id: 'settings', label: 'Cloud & OTA', icon: <SlidersHorizontal size={16} /> },
-    { id: 'logs', label: 'Event Logs', icon: <FileText size={16} /> },
+    { id: 'overview', label: 'Overview', mobileLabel: 'Overview', icon: <Activity size={16} /> },
+    { id: 'controls', label: 'Controls', mobileLabel: 'Controls', icon: <Sliders size={16} /> },
+    { id: 'timers', label: 'Timers & Logic', mobileLabel: 'Timers', icon: <Clock size={16} /> },
+    { id: 'settings', label: 'Cloud & OTA', mobileLabel: 'Cloud', icon: <SlidersHorizontal size={16} /> },
+    { id: 'logs', label: 'Event Logs', mobileLabel: 'Logs', icon: <FileText size={16} /> },
   ];
 
   // Combine UI logs + MongoDB Cloud Event logs
@@ -419,6 +465,16 @@ export default function App() {
             <span className="badge badge-purple" title="ESP32 Firmware Version">
               <Cpu size={11} /> {status?.firmwareVersion || 'v1.0.5'}
             </span>
+
+            {!isStandalone && (deferredPrompt || isIos) && (
+              <button
+                className="badge badge-install"
+                onClick={handleInstallApp}
+                title="Install Smart Solar as Mobile App"
+              >
+                <Download size={12} /> Install App
+              </button>
+            )}
           </div>
         </div>
 
@@ -434,6 +490,26 @@ export default function App() {
           ))}
         </nav>
       </header>
+
+      {/* iOS Safari Install Guide Banner */}
+      {showIosInstallTip && !isStandalone && (
+        <div className="glass-card animate-in" style={{ borderColor: 'rgba(56, 189, 248, 0.35)', background: 'rgba(56, 189, 248, 0.08)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', padding: '0.85rem 1.15rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+            <Smartphone size={18} className="text-cyan" style={{ flexShrink: 0 }} />
+            <span>
+              Tap the <strong style={{ color: 'var(--text-main)' }}>Share</strong> icon in Safari &rarr; <strong style={{ color: 'var(--accent-cyan)' }}>&quot;Add to Home Screen&quot;</strong> to install Smart Solar as an app.
+            </span>
+          </div>
+          <button
+            className="badge"
+            style={{ background: 'rgba(255,255,255,0.06)', color: 'var(--text-muted)', padding: '0.3rem' }}
+            onClick={() => setShowIosInstallTip(false)}
+            aria-label="Close install tip"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
 
       {/* Local Fallback Active Info Banner */}
       {status?.localFallbackActive && (
@@ -1231,6 +1307,20 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* =================== MOBILE BOTTOM NAVIGATION BAR =================== */}
+      <nav className="mobile-bottom-nav" aria-label="Mobile Navigation">
+        {tabs.map(tab => (
+          <button
+            key={tab.id}
+            className={`mobile-nav-btn ${activeTab === tab.id ? 'active' : ''}`}
+            onClick={() => setActiveTab(tab.id)}
+          >
+            {tab.icon}
+            <span>{tab.mobileLabel}</span>
+          </button>
+        ))}
+      </nav>
     </div>
   );
 }

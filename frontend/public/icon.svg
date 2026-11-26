@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#030712" />
+      <stop offset="100%" stop-color="#0c1428" />
+    </linearGradient>
+    <linearGradient id="boltGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#3b82f6" />
+    </linearGradient>
+    <radialGradient id="glowGrad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.32" />
+      <stop offset="70%" stop-color="#3b82f6" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#030712" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" ry="112" fill="url(#bgGrad)" />
+  <circle cx="256" cy="256" r="200" fill="url(#glowGrad)" />
+  <circle cx="256" cy="256" r="168" fill="none" stroke="url(#boltGrad)" stroke-width="10" stroke-opacity="0.35" stroke-dasharray="18 14" />
+  <circle cx="256" cy="256" r="142" fill="none" stroke="#38bdf8" stroke-width="4" stroke-opacity="0.2" />
+  <path d="M276 96 L152 276 H244 L224 416 L360 232 H266 Z" fill="url(#boltGrad)" stroke="#e0f2fe" stroke-width="6" stroke-linejoin="round" />
+</svg>
