@@ -9,7 +9,9 @@
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <WiFiClientSecure.h>
+#include <PubSubClient.h>
 #include "JK_BMS.h"
+#include "aws_certs.h"
 
 JKBMS jkbms;
 unsigned long lastBmsRequest = 0;
@@ -22,6 +24,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // RTC Setting
 RTC_DS3231 rtc;
+bool rtcFound = false;
 
 // WiFi Credentials
 const char* ssid = "SLT FIBER";
@@ -29,6 +32,23 @@ const char* password = "@Ashan20030118";
 
 // Firmware Versioning
 const char* FIRMWARE_VERSION = "v1.0.5";
+
+// ---------------------------------------------------------
+// MQTT Broker Configuration (Lightweight Cloud Sync)
+// ---------------------------------------------------------
+const char* mqtt_server       = "broker.emqx.io";
+const int   mqtt_port         = 1883;
+const char* mqtt_user         = ""; // Optional: set if using private HiveMQ/EMQX cluster
+const char* mqtt_pass         = "";
+const char* TOPIC_STATUS      = "ashan_smart_offgrid_v1/status";
+const char* TOPIC_COMMANDS    = "ashan_smart_offgrid_v1/commands";
+const char* TOPIC_HISTORY     = "ashan_smart_offgrid_v1/history";
+const char* TOPIC_AVAILABILITY = "ashan_smart_offgrid_v1/availability";
+
+WiFiClientSecure mqttSecureClient;
+WiFiClient mqttWifiClient;
+PubSubClient mqttClient;
+bool useAwsMtls = false;
 
 // NTP Time Client
 WiFiUDP ntpUDP;
@@ -83,6 +103,12 @@ bool forceChargingActive = false;
 bool manualInverterOverride = false;
 bool manualSmpsOverride = false;
 
+// --- Physical Switch Change Tracking (For Offline & Emergency Switch Priority) ---
+bool prevRawManual = false;
+bool prevRawEco = false;
+bool prevRawPcut = false;
+bool switchTrackerInitialized = false;
+
 // --- Flatline Detection (dV/dt) Variables ---
 unsigned long lastVoltageCheckTime = 0;
 float lastRecordedVoltage = 0.0;
@@ -100,13 +126,14 @@ const unsigned long GRID_DEBOUNCE_DELAY_MS = 1000; // 1 second debounce to filte
 float lastBatVolt = 0.0;
 float lastSolVolt = 0.0;
 
-// Function declarations for API
+// Function declarations for API & Tasks
 void handleGetStatus();
 void handleSetMode();
 void handleSetCharge();
 void handleSetRelay();
 void handleOTAUpdate();
 void syncFirebaseTask(void * pvParameters);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
 
 unsigned long lastAppHeartbeatTime = 0;
 String lastReceivedHeartbeatStr = ""; // To track if the heartbeat timestamp actually changed
@@ -114,9 +141,97 @@ const unsigned long ACTIVE_SESSION_TIMEOUT_MS = 10800000; // 3 Hours (10,800,000
 bool isAppSessionActive = true;
 TaskHandle_t FirebaseTaskHandle;
 
-// --- 15-Minute Periodic History Logging ---
+volatile bool forceImmediatePublish = false;
+String pendingOtaUrl = "";
+
+// --- 15-Minute Periodic History Logging & Offline Ring Buffer ---
 unsigned long lastHistoryLogTime = 0;
 const unsigned long HISTORY_LOG_INTERVAL = 900000; // 15 minutes (900,000 ms)
+
+struct OfflineHistoryRecord {
+  unsigned long epoch;
+  float batteryVoltage;
+  float batteryCurrent;
+  int batterySoc;
+  float cellVoltages[4];
+  float solarVoltage;
+  bool gridPresent;
+  bool inverterState;
+  bool smpsState;
+  char mode[18];
+};
+
+const int MAX_OFFLINE_HISTORY = 32; // Stores up to 8 hours of 15-min logs in RAM while offline
+OfflineHistoryRecord offlineHistoryBuffer[MAX_OFFLINE_HISTORY];
+int offlineHistoryHead = 0;
+int offlineHistoryCount = 0;
+
+// Helper to get current Unix Epoch (NTP when online, RTC DS3231 fallback when offline)
+unsigned long getCurrentEpoch() {
+  if (WiFi.status() == WL_CONNECTED) {
+    unsigned long ntpEpoch = timeClient.getEpochTime();
+    if (ntpEpoch > 1700000000UL) return ntpEpoch;
+  }
+  if (rtcFound) {
+    DateTime now = rtc.now();
+    unsigned long rtcEpoch = now.unixtime();
+    if (rtcEpoch > 1700000000UL) return rtcEpoch;
+  }
+  return millis() / 1000;
+}
+
+// Helper to enqueue a 15-minute history record when offline
+void enqueueOfflineHistory() {
+  int insertIdx = (offlineHistoryHead + offlineHistoryCount) % MAX_OFFLINE_HISTORY;
+  if (offlineHistoryCount == MAX_OFFLINE_HISTORY) {
+    // Buffer full: overwrite oldest entry
+    offlineHistoryHead = (offlineHistoryHead + 1) % MAX_OFFLINE_HISTORY;
+  } else {
+    offlineHistoryCount++;
+  }
+
+  OfflineHistoryRecord &rec = offlineHistoryBuffer[insertIdx];
+  rec.epoch = getCurrentEpoch();
+  rec.batteryVoltage = lastBatVolt;
+  rec.batteryCurrent = jkbms.current;
+  rec.batterySoc = jkbms.soc;
+  for (int i = 0; i < 4; i++) rec.cellVoltages[i] = jkbms.cellVoltages[i];
+  rec.solarVoltage = lastSolVolt;
+  rec.gridPresent = debouncedGridState;
+  rec.inverterState = inverterState;
+  rec.smpsState = smpsState;
+  strncpy(rec.mode, currentModeString.c_str(), sizeof(rec.mode) - 1);
+  rec.mode[sizeof(rec.mode) - 1] = '\0';
+}
+
+// Helper to build status JSON payload
+String buildStatusJson() {
+  String json = "{";
+  json += "\"epoch\":" + String(getCurrentEpoch()) + ",";
+  json += "\"batteryVoltage\":" + String(lastBatVolt, 2) + ",";
+  json += "\"batteryCurrent\":" + String(jkbms.current, 2) + ",";
+  json += "\"batterySoc\":" + String(jkbms.soc) + ",";
+  json += "\"cellVoltages\":[" + String(jkbms.cellVoltages[0], 3) + "," + String(jkbms.cellVoltages[1], 3) + "," + String(jkbms.cellVoltages[2], 3) + "," + String(jkbms.cellVoltages[3], 3) + "],";
+  json += "\"solarVoltage\":" + String(lastSolVolt, 2) + ",";
+  json += "\"gridPresent\":" + String(debouncedGridState ? "true" : "false") + ",";
+  json += "\"inverterState\":" + String(inverterState ? "true" : "false") + ",";
+  json += "\"smpsState\":" + String(smpsState ? "true" : "false") + ",";
+  json += "\"modeString\":\"" + currentModeString + "\",";
+  json += "\"webModeOverride\":" + String(webModeOverride) + ",";
+  json += "\"forceChargingActive\":" + String(forceChargingActive ? "true" : "false") + ",";
+  json += "\"topup530Active\":" + String(topup530Active ? "true" : "false") + ",";
+  json += "\"topup1amActive\":" + String(topup1amActive ? "true" : "false") + ",";
+  json += "\"normalChargingActive\":" + String(normalChargingActive ? "true" : "false") + ",";
+  json += "\"flatlineDetected\":" + String(flatlineDetected ? "true" : "false") + ",";
+  json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"mqttConnected\":" + String(mqttClient.connected() ? "true" : "false") + ",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"firmwareVersion\":\"" + String(FIRMWARE_VERSION) + "\",";
+  json += "\"sessionActive\":" + String(isAppSessionActive ? "true" : "false");
+  json += "}";
+  return json;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -150,17 +265,42 @@ void setup() {
   // Initialize RTC
   if (!rtc.begin()) {
     Serial.println("RTC Not Found!");
+    rtcFound = false;
+  } else {
+    rtcFound = true;
   }
 
   // Initialize debounced grid state to avoid 1-second false power-cut at boot
   lastGridRawState = digitalRead(GRID_SENS);
   debouncedGridState = lastGridRawState;
 
-  // Connect to WiFi
+  // Connect to WiFi (Non-blocking auto-reconnect enabled)
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
   timeClient.begin();
 
-  // Configure Web Server & CORS
+  // Configure MQTT Client (AWS IoT Core mTLS with Certificates if AWS_IOT_ENDPOINT is set, otherwise standard TCP)
+  if (String(AWS_IOT_ENDPOINT).indexOf("YOUR_AWS_IOT_ENDPOINT") == -1 && strlen(AWS_IOT_ENDPOINT) > 10) {
+    useAwsMtls = true;
+    mqttSecureClient.setCACert(AWS_CERT_CA);
+    mqttSecureClient.setCertificate(AWS_CERT_CRT);
+    mqttSecureClient.setPrivateKey(AWS_CERT_PRIVATE);
+    mqttClient.setClient(mqttSecureClient);
+    mqttClient.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
+    Serial.println("MQTT Configured with AWS IoT Core mTLS Certificates (Port 8883)");
+  } else {
+    useAwsMtls = false;
+    mqttClient.setClient(mqttWifiClient);
+    mqttClient.setServer(mqtt_server, mqtt_port);
+    Serial.println("MQTT Configured for Standard TCP Broker");
+  }
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(1024); // Ensure 1KB buffer for full JSON telemetry
+  mqttClient.setKeepAlive(15);
+  mqttClient.setSocketTimeout(3);
+
+  // Configure Local Web Server & CORS (Works on Local Wi-Fi even if Internet is down)
   server.enableCORS(true);
   server.on("/api/status", HTTP_GET, handleGetStatus);
   server.on("/api/mode", HTTP_POST, handleSetMode);
@@ -174,12 +314,12 @@ void setup() {
   server.begin();
   Serial.println("HTTP Web Server Started");
 
-  // Start Firebase Cloud Sync as a FreeRTOS Background Task on Core 0 (Network Core)
-  // This prevents the slow HTTPS handshakes from blocking the main loop (OLED & Switches)
+  // Start Lightweight MQTT & Offline Sync Task on Core 0 (Network Core)
+  // Core 1 runs OLED, JK BMS, Relays & Switches with zero network lag
   xTaskCreatePinnedToCore(
     syncFirebaseTask,   // Task function
-    "FirebaseTask",     // Name of task
-    8192,               // Stack size (8KB for HTTPS)
+    "NetworkSyncTask",  // Name of task
+    8192,               // Stack size
     NULL,               // Parameter
     1,                  // Priority
     &FirebaseTaskHandle,// Task handle
@@ -227,36 +367,16 @@ void drawWiFiBars(int x, int y) {
 }
 
 // ---------------------------------------------------------
-// 🌐 WEB SERVER API HANDLERS
+// 🌐 LOCAL WEB SERVER API HANDLERS (LAN FALLBACK)
 // ---------------------------------------------------------
 void handleGetStatus() {
-  String json = "{";
-  json += "\"batteryVoltage\":" + String(lastBatVolt, 2) + ",";
-  json += "\"batteryCurrent\":" + String(jkbms.current, 2) + ",";
-  json += "\"batterySoc\":" + String(jkbms.soc) + ",";
-  json += "\"cellVoltages\":[" + String(jkbms.cellVoltages[0], 3) + "," + String(jkbms.cellVoltages[1], 3) + "," + String(jkbms.cellVoltages[2], 3) + "," + String(jkbms.cellVoltages[3], 3) + "],";
-  json += "\"solarVoltage\":" + String(lastSolVolt, 2) + ",";
-  json += "\"gridPresent\":" + String(debouncedGridState ? "true" : "false") + ",";
-  json += "\"inverterState\":" + String(inverterState ? "true" : "false") + ",";
-  json += "\"smpsState\":" + String(smpsState ? "true" : "false") + ",";
-  json += "\"modeString\":\"" + currentModeString + "\",";
-  json += "\"webModeOverride\":" + String(webModeOverride) + ",";
-  json += "\"forceChargingActive\":" + String(forceChargingActive ? "true" : "false") + ",";
-  json += "\"topup530Active\":" + String(topup530Active ? "true" : "false") + ",";
-  json += "\"topup1amActive\":" + String(topup1amActive ? "true" : "false") + ",";
-  json += "\"normalChargingActive\":" + String(normalChargingActive ? "true" : "false") + ",";
-  json += "\"flatlineDetected\":" + String(flatlineDetected ? "true" : "false") + ",";
-  json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-  json += "\"firmwareVersion\":\"" + String(FIRMWARE_VERSION) + "\"";
-  json += "}";
-  server.send(200, "application/json", json);
+  server.send(200, "application/json", buildStatusJson());
 }
 
 void handleSetMode() {
   if (server.hasArg("mode")) {
     webModeOverride = server.arg("mode").toInt();
+    forceImmediatePublish = true;
   }
   server.send(200, "application/json", "{\"success\":true,\"webModeOverride\":" + String(webModeOverride) + "}");
 }
@@ -268,6 +388,7 @@ void handleSetCharge() {
   } else {
     forceChargingActive = !forceChargingActive;
   }
+  forceImmediatePublish = true;
   server.send(200, "application/json", "{\"success\":true,\"forceChargingActive\":" + String(forceChargingActive ? "true" : "false") + "}");
 }
 
@@ -278,6 +399,7 @@ void handleSetRelay() {
   if (server.hasArg("smps")) {
     manualSmpsOverride = (server.arg("smps") == "true" || server.arg("smps") == "1");
   }
+  forceImmediatePublish = true;
   server.send(200, "application/json", "{\"success\":true}");
 }
 
@@ -288,163 +410,207 @@ void handleOTAUpdate() {
   }
   String firmwareUrl = server.arg("url");
   server.send(200, "application/json", "{\"success\":true,\"message\":\"Starting OTA update from GitHub...\"}");
-  
-  WiFiClientSecure client;
-  client.setInsecure(); // Skip HTTPS cert check for GitHub raw binary download
-  
-  t_httpUpdate_return ret = httpUpdate.update(client, firmwareUrl);
-  if (ret == HTTP_UPDATE_OK) {
-    Serial.println("OTA Update Successful! Restarting ESP32...");
-  } else {
-    Serial.printf("OTA Update Failed. Error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+  pendingOtaUrl = firmwareUrl;
+}
+
+// ---------------------------------------------------------
+// ⚡ INSTANT MQTT COMMAND CALLBACK (0ms Polling Overhead)
+// ---------------------------------------------------------
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  msg.reserve(length + 1);
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  bool stateChanged = false;
+
+  // 1. Parse webModeOverride if present
+  int modeIdx = msg.indexOf("\"webModeOverride\":");
+  if (modeIdx != -1) {
+    int val = msg.substring(modeIdx + 18).toInt();
+    if (val >= -1 && val <= 4) {
+      webModeOverride = val;
+      stateChanged = true;
+    }
+  }
+
+  // 2. Parse forceChargingActive if present
+  int chargeIdx = msg.indexOf("\"forceChargingActive\":");
+  if (chargeIdx != -1) {
+    String valStr = msg.substring(chargeIdx + 22, min((int)msg.length(), chargeIdx + 28));
+    forceChargingActive = (valStr.indexOf("true") != -1 || valStr.indexOf("1") != -1);
+    stateChanged = true;
+  }
+
+  // 3. Parse manual relay overrides if present
+  int invIdx = msg.indexOf("\"inverter\":");
+  if (invIdx != -1) {
+    String valStr = msg.substring(invIdx + 11, min((int)msg.length(), invIdx + 17));
+    manualInverterOverride = (valStr.indexOf("true") != -1 || valStr.indexOf("1") != -1);
+    stateChanged = true;
+  }
+
+  int smpsIdx = msg.indexOf("\"smps\":");
+  if (smpsIdx != -1) {
+    String valStr = msg.substring(smpsIdx + 7, min((int)msg.length(), smpsIdx + 13));
+    manualSmpsOverride = (valStr.indexOf("true") != -1 || valStr.indexOf("1") != -1);
+    stateChanged = true;
+  }
+
+  // 4. Parse lastHeartbeat / app active ping
+  int hbIdx = msg.indexOf("\"lastHeartbeat\":");
+  if (hbIdx != -1) {
+    int commaIdx = msg.indexOf(",", hbIdx);
+    if (commaIdx == -1) commaIdx = msg.indexOf("}", hbIdx);
+    if (commaIdx != -1) {
+      String hbValue = msg.substring(hbIdx + 16, commaIdx);
+      if (hbValue != lastReceivedHeartbeatStr) {
+        lastReceivedHeartbeatStr = hbValue;
+        lastAppHeartbeatTime = millis();
+        isAppSessionActive = true;
+      }
+    }
+  }
+
+  // 5. Parse otaUrl if present (Cloud OTA Update Trigger)
+  int otaIdx = msg.indexOf("\"otaUrl\":\"");
+  if (otaIdx != -1) {
+    int endOta = msg.indexOf("\"", otaIdx + 10);
+    if (endOta != -1) {
+      String otaUrl = msg.substring(otaIdx + 10, endOta);
+      if (otaUrl.length() > 10) {
+        pendingOtaUrl = otaUrl;
+      }
+    }
+  }
+
+  if (stateChanged) {
+    forceImmediatePublish = true;
   }
 }
 
 // ---------------------------------------------------------
-// 🌐 GLOBAL FIREBASE CLOUD REALTIME SYNC (FREE RTOS TASK)
+// 🌐 LIGHTWEIGHT MQTT & OFFLINE-RESILIENT TASK (CORE 0)
 // ---------------------------------------------------------
 void syncFirebaseTask(void * pvParameters) {
-  // Create HTTP and Secure Client objects once outside the loop to prevent memory fragmentation
-  HTTPClient http;
-  WiFiClientSecure client;
-  client.setInsecure(); // Required for ESP32 to bypass HTTPS certificate validation
+  unsigned long lastWifiCheck = 0;
+  unsigned long lastMqttReconnectAttempt = 0;
+  unsigned long lastStatusPublish = 0;
 
   for (;;) {
-    if (WiFi.status() == WL_CONNECTED) {
-      http.setTimeout(3000);
+    unsigned long now = millis();
 
-      // 1. Fetch pending global web commands & app heartbeat from Firebase
-      String commandUrl = "https://my-smart-off-grid-default-rtdb.firebaseio.com/commands.json";
-      http.begin(client, commandUrl); // Use WiFiClientSecure
-      int httpCode = http.GET();
-      
-      if (httpCode == 200) {
-        String payload = http.getString();
-        
-        // Parse webModeOverride if present
-        int modeIdx = payload.indexOf("\"webModeOverride\":");
-        if (modeIdx != -1) {
-          int val = payload.substring(modeIdx + 18).toInt();
-          if (val >= -1 && val <= 4) webModeOverride = val;
-        }
-        
-        // Parse forceChargingActive if present
-        int chargeIdx = payload.indexOf("\"forceChargingActive\":");
-        if (chargeIdx != -1) {
-          String valStr = payload.substring(chargeIdx + 22, chargeIdx + 27);
-          forceChargingActive = (valStr.indexOf("true") != -1);
-        }
-        
-        // Parse lastHeartbeat / app active ping (Only reset timer if value CHANGED)
-        int hbIdx = payload.indexOf("\"lastHeartbeat\":");
-        if (hbIdx != -1) {
-          int commaIdx = payload.indexOf(",", hbIdx);
-          if (commaIdx == -1) commaIdx = payload.indexOf("}", hbIdx);
-          if (commaIdx != -1) {
-            String hbValue = payload.substring(hbIdx + 16, commaIdx);
-            if (hbValue != lastReceivedHeartbeatStr) {
-               lastReceivedHeartbeatStr = hbValue; // Update tracker
-               lastAppHeartbeatTime = millis();    // Reset the 3-hour timeout timer
-            }
-          }
-        }
-        // Parse otaUrl if present (Cloud OTA Update Trigger)
-        int otaIdx = payload.indexOf("\"otaUrl\":\"");
-        if (otaIdx != -1) {
-          int endOta = payload.indexOf("\"", otaIdx + 10);
-          if (endOta != -1) {
-            String otaUrl = payload.substring(otaIdx + 10, endOta);
-            if (otaUrl.length() > 10) {
-              Serial.println("OTA Command received from Cloud! Downloading: " + otaUrl);
-              // Clear otaUrl in Firebase so it doesn't loop
-              http.end();
-              http.begin(client, "https://my-smart-off-grid-default-rtdb.firebaseio.com/commands.json");
-              http.addHeader("Content-Type", "application/json");
-              http.PATCH("{\"otaUrl\":\"\"}");
-              http.end();
+    // 1. Periodic 15-Minute History Snapshot Recording (Works Online AND Offline!)
+    if (lastHistoryLogTime == 0 || (now - lastHistoryLogTime >= HISTORY_LOG_INTERVAL)) {
+      lastHistoryLogTime = now;
+      enqueueOfflineHistory();
+    }
 
-              // Perform OTA Update
-              t_httpUpdate_return ret = httpUpdate.update(client, otaUrl);
-              if (ret == HTTP_UPDATE_OK) {
-                Serial.println("OTA Update Successful! Restarting ESP32...");
-                ESP.restart();
-              }
-            }
-          }
-        }
+    // 2. Non-Blocking Wi-Fi Connection Supervision
+    if (WiFi.status() != WL_CONNECTED) {
+      if (now - lastWifiCheck >= 5000) {
+        lastWifiCheck = now;
+        WiFi.reconnect();
       }
-      http.end();
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+      continue;
+    }
 
-      // Evaluate if App session is active (App opened within 3 hours or pinged)
-      if (lastAppHeartbeatTime == 0) lastAppHeartbeatTime = millis(); // Boot default
-      if ((millis() - lastAppHeartbeatTime) < ACTIVE_SESSION_TIMEOUT_MS) {
-        isAppSessionActive = true;
+    // 3. Handle Pending OTA Firmware Update (Only when triggered)
+    if (pendingOtaUrl.length() > 10) {
+      String urlToFlash = pendingOtaUrl;
+      pendingOtaUrl = "";
+      Serial.println("Starting OTA Update from: " + urlToFlash);
+
+      WiFiClientSecure otaClient;
+      otaClient.setInsecure();
+      t_httpUpdate_return ret = httpUpdate.update(otaClient, urlToFlash);
+      if (ret == HTTP_UPDATE_OK) {
+        Serial.println("OTA Update Successful! Restarting ESP32...");
+        ESP.restart();
       } else {
-        isAppSessionActive = false;
-      }
-
-      // 2. Push status telemetry to Firebase ONLY when App session is active
-      if (isAppSessionActive) {
-        String firebaseUrl = "https://my-smart-off-grid-default-rtdb.firebaseio.com/status.json";
-        http.begin(client, firebaseUrl); // Use WiFiClientSecure
-        http.addHeader("Content-Type", "application/json");
-
-        String jsonPayload = "{";
-        jsonPayload += "\"batteryVoltage\":" + String(lastBatVolt, 2) + ",";
-        jsonPayload += "\"batteryCurrent\":" + String(jkbms.current, 2) + ",";
-        jsonPayload += "\"batterySoc\":" + String(jkbms.soc) + ",";
-        jsonPayload += "\"cellVoltages\":[" + String(jkbms.cellVoltages[0], 3) + "," + String(jkbms.cellVoltages[1], 3) + "," + String(jkbms.cellVoltages[2], 3) + "," + String(jkbms.cellVoltages[3], 3) + "],";
-        jsonPayload += "\"solarVoltage\":" + String(lastSolVolt, 2) + ",";
-        jsonPayload += "\"gridPresent\":" + String(debouncedGridState ? "true" : "false") + ",";
-        jsonPayload += "\"inverterState\":" + String(inverterState ? "true" : "false") + ",";
-        jsonPayload += "\"smpsState\":" + String(smpsState ? "true" : "false") + ",";
-        jsonPayload += "\"modeString\":\"" + currentModeString + "\",";
-        jsonPayload += "\"webModeOverride\":" + String(webModeOverride) + ",";
-        jsonPayload += "\"forceChargingActive\":" + String(forceChargingActive ? "true" : "false") + ",";
-        jsonPayload += "\"topup530Active\":" + String(topup530Active ? "true" : "false") + ",";
-        jsonPayload += "\"topup1amActive\":" + String(topup1amActive ? "true" : "false") + ",";
-        jsonPayload += "\"normalChargingActive\":" + String(normalChargingActive ? "true" : "false") + ",";
-        jsonPayload += "\"flatlineDetected\":" + String(flatlineDetected ? "true" : "false") + ",";
-        jsonPayload += "\"wifiConnected\":true,";
-        jsonPayload += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-        jsonPayload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-        jsonPayload += "\"firmwareVersion\":\"" + String(FIRMWARE_VERSION) + "\",";
-        jsonPayload += "\"sessionActive\":true";
-        jsonPayload += "}";
-
-        http.PUT(jsonPayload);
-        http.end();
-      }
-
-      // 3. Periodic 15-Minute History Logging to Firebase Database
-      if (lastHistoryLogTime == 0 || (millis() - lastHistoryLogTime >= HISTORY_LOG_INTERVAL)) {
-        lastHistoryLogTime = millis();
-        String historyUrl = "https://my-smart-off-grid-default-rtdb.firebaseio.com/history.json";
-        http.begin(client, historyUrl);
-        http.addHeader("Content-Type", "application/json");
-
-        String histPayload = "{";
-        histPayload += "\"epoch\":" + String(timeClient.getEpochTime()) + ",";
-        histPayload += "\"time\":\"" + timeClient.getFormattedTime() + "\",";
-        histPayload += "\"batteryVoltage\":" + String(lastBatVolt, 2) + ",";
-        histPayload += "\"batteryCurrent\":" + String(jkbms.current, 2) + ",";
-        histPayload += "\"batterySoc\":" + String(jkbms.soc) + ",";
-        histPayload += "\"cellVoltages\":[" + String(jkbms.cellVoltages[0], 3) + "," + String(jkbms.cellVoltages[1], 3) + "," + String(jkbms.cellVoltages[2], 3) + "," + String(jkbms.cellVoltages[3], 3) + "],";
-        histPayload += "\"solarVoltage\":" + String(lastSolVolt, 2) + ",";
-        histPayload += "\"gridPresent\":" + String(debouncedGridState ? "true" : "false") + ",";
-        histPayload += "\"inverterState\":" + String(inverterState ? "true" : "false") + ",";
-        histPayload += "\"smpsState\":" + String(smpsState ? "true" : "false") + ",";
-        histPayload += "\"mode\":\"" + currentModeString + "\"";
-        histPayload += "}";
-
-        http.POST(histPayload);
-        http.end();
+        Serial.printf("OTA Update Failed (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
       }
     }
-    
-    // Wait 2.5 seconds before the next Firebase sync
-    // vTaskDelay frees up Core 0 to handle WiFi duties without blocking
-    vTaskDelay(2500 / portTICK_PERIOD_MS);
+
+    // 4. Non-Blocking MQTT Reconnection with Last Will & Testament (LWT)
+    if (!mqttClient.connected()) {
+      if (now - lastMqttReconnectAttempt >= 5000) {
+        lastMqttReconnectAttempt = now;
+        String clientId = "ESP32_SmartOffGrid_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+        bool connected = false;
+        if (strlen(mqtt_user) > 0) {
+          connected = mqttClient.connect(
+            clientId.c_str(),
+            mqtt_user,
+            mqtt_pass,
+            TOPIC_AVAILABILITY,
+            1,
+            true,
+            "offline"
+          );
+        } else {
+          connected = mqttClient.connect(
+            clientId.c_str(),
+            TOPIC_AVAILABILITY,
+            1,
+            true,
+            "offline"
+          );
+        }
+
+        if (connected) {
+          Serial.println("MQTT Connected! Publishing online availability & subscribing...");
+          mqttClient.publish(TOPIC_AVAILABILITY, "online", true);
+          mqttClient.subscribe(TOPIC_COMMANDS, 1);
+          forceImmediatePublish = true;
+        }
+      }
+    } else {
+      // Process incoming MQTT packets instantly
+      mqttClient.loop();
+
+      // 5. Evaluate 3-Hour App Heartbeat Session Timeout
+      if (lastAppHeartbeatTime == 0) lastAppHeartbeatTime = now;
+      isAppSessionActive = ((now - lastAppHeartbeatTime) < ACTIVE_SESSION_TIMEOUT_MS);
+
+      // 6. Publish Live Telemetry every 2 seconds (or immediately upon command execution)
+      if (forceImmediatePublish || (isAppSessionActive && (now - lastStatusPublish >= 2000))) {
+        forceImmediatePublish = false;
+        lastStatusPublish = now;
+        String statusPayload = buildStatusJson();
+        mqttClient.publish(TOPIC_STATUS, statusPayload.c_str(), false);
+      }
+
+      // 7. Flush Any Offline-Buffered 15-Minute History Logs to Backend -> MongoDB
+      if (offlineHistoryCount > 0) {
+        OfflineHistoryRecord &rec = offlineHistoryBuffer[offlineHistoryHead];
+
+        String histJson = "{";
+        histJson += "\"epoch\":" + String(rec.epoch) + ",";
+        histJson += "\"batteryVoltage\":" + String(rec.batteryVoltage, 2) + ",";
+        histJson += "\"batteryCurrent\":" + String(rec.batteryCurrent, 2) + ",";
+        histJson += "\"batterySoc\":" + String(rec.batterySoc) + ",";
+        histJson += "\"cellVoltages\":[" + String(rec.cellVoltages[0], 3) + "," + String(rec.cellVoltages[1], 3) + "," + String(rec.cellVoltages[2], 3) + "," + String(rec.cellVoltages[3], 3) + "],";
+        histJson += "\"solarVoltage\":" + String(rec.solarVoltage, 2) + ",";
+        histJson += "\"gridPresent\":" + String(rec.gridPresent ? "true" : "false") + ",";
+        histJson += "\"inverterState\":" + String(rec.inverterState ? "true" : "false") + ",";
+        histJson += "\"smpsState\":" + String(rec.smpsState ? "true" : "false") + ",";
+        histJson += "\"mode\":\"" + String(rec.mode) + "\",";
+        histJson += "\"offlineBuffered\":true";
+        histJson += "}";
+
+        if (mqttClient.publish(TOPIC_HISTORY, histJson.c_str(), false)) {
+          offlineHistoryHead = (offlineHistoryHead + 1) % MAX_OFFLINE_HISTORY;
+          offlineHistoryCount--;
+        }
+      }
+    }
+
+    // Yield 50ms on Core 0 so MQTT callbacks respond within milliseconds while keeping CPU cool
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
@@ -472,14 +638,14 @@ void loop() {
     currentHour = timeClient.getHours(); 
     currentMinute = timeClient.getMinutes(); 
     static unsigned long lastRtcSync = 0;
-    if (millis() - lastRtcSync >= 3600000 || lastRtcSync == 0) {
+    if (rtcFound && (millis() - lastRtcSync >= 3600000 || lastRtcSync == 0)) {
       unsigned long epoch = timeClient.getEpochTime();
       if (epoch > 1767225600) { 
         rtc.adjust(DateTime(epoch)); 
         lastRtcSync = millis();
       }
     }
-  } else {
+  } else if (rtcFound) {
     DateTime now = rtc.now();
     char buf[] = "hh:mm";
     displayTime = String(now.toString(buf));
@@ -505,6 +671,23 @@ void loop() {
   bool rawManual = (digitalRead(MANUAL_SWITCH) == LOW); 
   bool rawEco   = rawManual ? false : (digitalRead(ECO_SWITCH) == LOW);
   bool rawPcut  = rawManual ? false : (digitalRead(PCUT_SWITCH) == LOW);
+
+  // Offline / Physical Switch Priority Recovery:
+  // If someone physically toggles a switch on the enclosure, automatically clear Web Override (-1)
+  if (!switchTrackerInitialized) {
+    prevRawManual = rawManual;
+    prevRawEco = rawEco;
+    prevRawPcut = rawPcut;
+    switchTrackerInitialized = true;
+  } else if (rawManual != prevRawManual || rawEco != prevRawEco || rawPcut != prevRawPcut) {
+    prevRawManual = rawManual;
+    prevRawEco = rawEco;
+    prevRawPcut = rawPcut;
+    if (webModeOverride != -1) {
+      webModeOverride = -1; // Hand control back to physical switches immediately
+      forceImmediatePublish = true;
+    }
+  }
 
   // Evaluate Active Mode (Physical Switches or Web Override)
   bool manualMode = rawManual;

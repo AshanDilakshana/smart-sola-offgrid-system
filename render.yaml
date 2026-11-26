@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: smart-solar-offgrid-backend
+    runtime: node
+    rootDir: backend
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: AWS_IOT_ENDPOINT
+        value: a1ftomq193a3f9-ats.iot.us-east-1.amazonaws.com
+      - key: MQTT_TOPIC_PREFIX
+        value: ashan_smart_offgrid_v1
+      - key: HISTORY_LOG_INTERVAL_MINUTES
+        value: 15
+      - key: MONGODB_URI
+        sync: false

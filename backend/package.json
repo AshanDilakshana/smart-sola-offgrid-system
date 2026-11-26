@@ -1,0 +1,18 @@
+{
+  "name": "smart-solar-offgrid-backend",
+  "version": "1.0.5",
+  "description": "Hosted Node.js Backend with MQTT Broker Bridge, MongoDB Persistence & Real-Time SSE Stream for Smart Solar Off-Grid ESP32 System",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.3.2",
+    "mqtt": "^5.5.4"
+  }
+}
