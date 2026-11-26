@@ -868,10 +868,14 @@ export default function App() {
             <div className="glass-card info-card">
               <div className="card-header">
                 <span className="card-label">Solar PV Array</span>
-                <Sun size={16} color="var(--accent-yellow)" />
+                <Sun size={16} color={(status?.solarVoltage || 0) >= 10.0 ? 'var(--accent-green)' : 'var(--accent-yellow)'} />
               </div>
-              <div className="card-value">0.0<span style={{ fontSize: '0.9rem', color: 'var(--text-muted)', fontWeight: 500 }}> V</span></div>
-              <div className="card-subtitle">Battery Backup Mode (PV Sensor bypassed)</div>
+              <div className="card-value" style={{ color: (status?.solarVoltage || 0) >= 10.0 ? 'var(--accent-green)' : 'var(--text-main)' }}>
+                {(status?.solarVoltage ?? 0).toFixed(1)}<span style={{ fontSize: '0.9rem', color: 'var(--text-muted)', fontWeight: 500 }}> V</span>
+              </div>
+              <div className="card-subtitle">
+                {(status?.solarVoltage || 0) >= 10.0 ? '☀️ Sunlight Active (ECO Ready ≥ 10.0V)' : 'ECO Window: 08:00 AM – 04:30 PM (≥ 10.0V)'}
+              </div>
             </div>
           </div>
 
@@ -1133,6 +1137,22 @@ export default function App() {
               <Gauge size={18} color="var(--accent-green)" /> Hardware Protection & Charging Thresholds
             </h2>
             <div className="timers-grid">
+              <div className="info-item">
+                <span className="label">ECO Solar PV Minimum Voltage</span>
+                <span className="value text-green">&ge; 10.0 V</span>
+              </div>
+              <div className="info-item">
+                <span className="label">ECO Sunlight Time Window</span>
+                <span className="value text-cyan">08:00 AM – 04:30 PM</span>
+              </div>
+              <div className="info-item">
+                <span className="label">ECO Inverter Start (Battery Full)</span>
+                <span className="value text-green">&ge; 14.2 V / 90% SOC</span>
+              </div>
+              <div className="info-item">
+                <span className="label">ECO Inverter Stop (Night Reserve)</span>
+                <span className="value text-yellow">&le; 13.1 V / 65% SOC</span>
+              </div>
               <div className="info-item">
                 <span className="label">Low Battery Inverter Cutoff</span>
                 <span className="value text-red">12.0 V</span>

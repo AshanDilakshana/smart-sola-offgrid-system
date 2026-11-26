@@ -75,6 +75,21 @@ const int MANUAL_SWITCH = 13;
 const unsigned long TIMER_DELAY_MS = 120000; 
 const int TIMER_DELAY_SEC = 120;
 
+// --- Solar Voltage Divider Calibration (Pin 32) ---
+const float R1 = 100000.0; 
+const float R2 = 10000.0;  
+const float V_REF = 3.6565;
+
+// --- Smart Solar ECO Mode Configuration (Solar + Time + Battery Level) ---
+const float ECO_SOLAR_MIN_VOLT = 11.5; // Minimum Solar voltage required to enable/keep ECO inverter (10.0V)
+const float ECO_BAT_START_VOLT = 14.2; // Battery voltage threshold to start ECO inverter (Battery Full)
+const float ECO_BAT_STOP_VOLT  = 13.1; // Battery voltage threshold to stop ECO inverter (Reserve for night)
+const int   ECO_START_SOC      = 90;   // JK BMS SOC% to start ECO inverter
+const int   ECO_STOP_SOC       = 65;   // JK BMS SOC% to stop ECO inverter
+const int   ECO_SUN_START_HOUR = 8;    // Sunlight time window start: 08:00 AM
+const int   ECO_SUN_END_HOUR   = 16;   // Sunlight time window end:   04:30 PM (16:30)
+const int   ECO_SUN_END_MIN    = 30;
+
 // --- Charging Voltage Configuration ---
 const float BAT_CHARGE_START_THRESHOLD = 12.5; // Start normal charging below this voltage (Default: 12.5V)
 const float BAT_CHARGE_STOP_THRESHOLD  = 15.5; // Stop charging when battery reaches this voltage (Below inverter OVP 15.5V)
@@ -339,8 +354,26 @@ float getBatteryVoltage() {
 }
 
 float getSolarVoltage() {
-  // Solar panels are disconnected. Return 0.0V to prevent floating pin readings.
-  return 0.0;
+  long sum = 0;
+  int samples = 200; 
+  
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(SOLAR_PIN);
+    delayMicroseconds(50);
+  }
+  
+  float raw = (float)sum / samples;
+  float v_out = (raw * V_REF) / 4095.0; 
+  float newVolt = v_out * ((R1 + R2) / R2);
+
+  // EMA Low-Pass Filter for high stability
+  if (lastSolVolt == 0.0) {
+    lastSolVolt = newVolt;
+  } else {
+    lastSolVolt = (0.05 * newVolt) + (0.95 * lastSolVolt);
+  }
+  if (lastSolVolt < 1.5) return 0.0; // Filter out zero-light ADC floor noise
+  return lastSolVolt;
 }
 
 // ---------------------------------------------------------
@@ -719,12 +752,34 @@ void loop() {
   }
 
   // ---------------------------------------------------------
+  // ☀️ SMART SOLAR ECO CONDITIONS (SOLAR VOLTAGE + TIME WINDOW + BATTERY LEVEL)
+  // ---------------------------------------------------------
+  // 1. Time Window Check: 08:00 AM to 04:30 PM (Daytime sunlight hours)
+  bool isSunlightTime = (currentHour >= ECO_SUN_START_HOUR) &&
+                        (currentHour < ECO_SUN_END_HOUR || (currentHour == ECO_SUN_END_HOUR && currentMinute <= ECO_SUN_END_MIN));
+
+  // 2. Solar Panel Voltage Check: >= 14.0V
+  bool isSolarAvailable = (solVolt >= ECO_SOLAR_MIN_VOLT);
+
+  // 3. Battery Level Check (From JK BMS Voltage & SOC%)
+  bool isBatteryFullForEco = (batVolt >= ECO_BAT_START_VOLT) || (jkbms.dataValid && jkbms.soc >= ECO_START_SOC);
+  bool isBatteryLowForEco  = (batVolt <= ECO_BAT_STOP_VOLT)  || (jkbms.dataValid && jkbms.soc > 0 && jkbms.soc <= ECO_STOP_SOC);
+
+  // ---------------------------------------------------------
   // ⏳ SMART TIMER LOGIC
   // ---------------------------------------------------------
   bool shouldRunGridReturnTimer = false;
   if (isGrid && inverterState) {
-    if (pcutMode || ecoMode) {
+    if (pcutMode && !ecoMode) {
+      // Pure POWER CUT mode: turn off inverter after 120s when grid returns
       shouldRunGridReturnTimer = true; 
+    }
+    else if (ecoMode) {
+      // ECO MODE or ECO+POWER CUT mode while Grid is ON:
+      // Run 120s turn-off delay when sunlight ends, time window ends, or battery drops to reserve threshold
+      if (!isSunlightTime || !isSolarAvailable || isBatteryLowForEco) {
+        shouldRunGridReturnTimer = true;
+      }
     }
   }
 
@@ -784,23 +839,51 @@ void loop() {
     modeString = "ECO+POWER CUT"; 
     
     if (!isGrid) {
+      // Grid is DOWN: Act as UPS Backup
       if (inverterState) {
+        // Inverter was already ON from Solar ECO -> stay ON unless battery critically low
         if (batVolt <= 12.0) inverterState = false;
       } else {
+        // Wait for 120s Power-Cut timer before turning Inverter ON
         if (powerCutTimerActive && (millis() - powerCutTime >= TIMER_DELAY_MS) && batVolt >= 12.5) {
           inverterState = true;
         }
         if (batVolt <= 12.0) inverterState = false;
       }
     } else {
-      if (gridReturnTimerActive && (millis() - gridReturnTime >= TIMER_DELAY_MS)) {
+      // Grid is ONLINE: Run daytime Solar ECO logic (Solar Voltage + Sunlight Time + Battery Full)
+      if (isSunlightTime && isSolarAvailable && isBatteryFullForEco) {
+        inverterState = true;
+      }
+
+      if (batVolt <= 12.0) {
         inverterState = false;
+      } else if (!isSunlightTime || !isSolarAvailable || isBatteryLowForEco) {
+        if (gridReturnTimerActive && (millis() - gridReturnTime >= TIMER_DELAY_MS)) {
+          inverterState = false;
+        }
       }
     }
   } 
   else if (ecoMode) {
     modeString = "ECO MODE";
-    inverterState = false;
+    // Turn ON Inverter when in daytime sunlight window (8:00 AM - 4:30 PM), Solar >= 14.0V, and Battery is Full
+    if (isSunlightTime && isSolarAvailable && isBatteryFullForEco) {
+      inverterState = true;
+    }
+
+    // Turn OFF Inverter immediately if battery critically low (<= 12.0V), or after 120s timer if ECO conditions end
+    if (batVolt <= 12.0) {
+      inverterState = false;
+    } else if (!isSunlightTime || !isSolarAvailable || isBatteryLowForEco) {
+      if (isGrid) {
+        if (gridReturnTimerActive && (millis() - gridReturnTime >= TIMER_DELAY_MS)) {
+          inverterState = false;
+        }
+      } else {
+        inverterState = false;
+      }
+    }
   } 
   else if (pcutMode) {
     modeString = "POWER CUT"; 
