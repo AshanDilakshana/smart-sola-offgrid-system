@@ -197,6 +197,7 @@ TaskHandle_t FirebaseTaskHandle;
 volatile bool forceImmediatePublish = false;
 char pendingOtaUrlBuf[256] = "";
 volatile bool hasPendingOta = false;
+volatile bool otaInProgress = false;
 
 void setPendingOtaUrlSafe(const char* url) {
   if (!url) return;
@@ -742,15 +743,34 @@ void syncFirebaseTask(void * pvParameters) {
     if (takePendingOtaUrlSafe(otaUrlBuf, sizeof(otaUrlBuf))) {
       String urlToFlash = String(otaUrlBuf);
       Serial.println("Starting OTA Update from: " + urlToFlash);
+      otaInProgress = true;
+
+      // CRITICAL: Disconnect MQTT & stop AWS mTLS socket FIRST to free ~50KB contiguous RAM!
+      // Without this, opening a second simultaneous WiFiClientSecure TLS session to GitHub fails with OOM.
+      if (mqttClient.connected()) {
+        mqttClient.disconnect();
+      }
+      if (useAwsMtls) {
+        mqttSecureClient.stop();
+      } else {
+        mqttWifiClient.stop();
+      }
+      vTaskDelay(300 / portTICK_PERIOD_MS);
 
       WiFiClientSecure otaClient;
       otaClient.setInsecure();
+      otaClient.setTimeout(15); // 15s timeout for weak Wi-Fi (-87 dBm)
+      httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+      httpUpdate.rebootOnUpdate(true);
+
       t_httpUpdate_return ret = httpUpdate.update(otaClient, urlToFlash);
       if (ret == HTTP_UPDATE_OK) {
         Serial.println(F("OTA Update Successful! Restarting ESP32..."));
         ESP.restart();
       } else {
+        otaInProgress = false;
         Serial.printf("OTA Update Failed (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+        lastMqttReconnectAttempt = 0; // Reconnect MQTT immediately
       }
     }
 
@@ -1377,7 +1397,11 @@ void loop() {
     display.drawFastHLine(0, 11, 128, SSD1306_WHITE);
 
     display.setCursor(0, 20);
-    if (countdownSecs >= 0) {
+    if (otaInProgress) {
+      display.setTextSize(2);
+      display.print(F("OTA UPDATE"));
+    }
+    else if (countdownSecs >= 0) {
       display.setTextSize(2); 
       display.print(countdownSecs);
       display.print(F("s WAIT"));
@@ -1397,7 +1421,10 @@ void loop() {
     display.setTextSize(1);
     display.setCursor(0, 50);
     
-    if (strcmp(modeString, "ERROR") == 0) {
+    if (otaInProgress) {
+      display.print(F("Flashing via Wi-Fi..."));
+    }
+    else if (strcmp(modeString, "ERROR") == 0) {
       display.print(F("Fault: "));
       display.print(errorString);
     } 
