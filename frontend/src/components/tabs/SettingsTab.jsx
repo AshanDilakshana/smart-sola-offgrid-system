@@ -1,5 +1,5 @@
 import React from 'react';
-import { Server, Gauge, CloudLightning, CheckCircle2 } from 'lucide-react';
+import { Server, Gauge, CloudLightning, CheckCircle2, RefreshCw, Sparkles } from 'lucide-react';
 
 const THRESHOLDS = [
   { label: 'Low battery inverter cutoff', value: '12.0 V', tone: 'danger', pct: 12 },
@@ -10,7 +10,21 @@ const THRESHOLDS = [
   { label: 'BMS wire fault protection', value: '< 5.0 V', tone: 'danger', pct: 4 },
 ];
 
-export default function SettingsTab({ status, loading, backendUrlInput, onBackendUrlChange, onSaveBackendUrl, onOta }) {
+export default function SettingsTab({
+  status,
+  loading,
+  backendUrlInput,
+  onBackendUrlChange,
+  onSaveBackendUrl,
+  onOta,
+  remoteFirmware,
+  hasFirmwareUpdate,
+  checkingFirmware,
+  onCheckFirmware,
+}) {
+  const installedVer = status?.firmwareVersion || 'v1.0.5';
+  const latestVer = remoteFirmware?.version || installedVer;
+
   return (
     <div className="tab-panel stack">
       <section className="card reveal">
@@ -67,20 +81,61 @@ export default function SettingsTab({ status, loading, backendUrlInput, onBacken
         <header className="card-head">
           <div className="card-title">
             <span className="icon-tile icon-tile--violet"><CloudLightning size={16} /></span>
-            <div><h2>Over-The-Air Firmware Update</h2><p>Flash the latest GitHub Actions build over Wi-Fi</p></div>
+            <div><h2>Over-The-Air Firmware Update</h2><p>Flash the latest GitHub Actions build over Wi-Fi (No USB needed)</p></div>
           </div>
+          {hasFirmwareUpdate ? (
+            <span className="chip chip--warning mono">
+              <Sparkles size={13} /> Update Available ({latestVer})
+            </span>
+          ) : (
+            <span className="chip chip--success mono">
+              <CheckCircle2 size={13} /> Up to date
+            </span>
+          )}
         </header>
         <div className="ota-row">
           <div>
-            <div className="ota-version">
-              Device firmware <span className="chip chip--violet mono">{status?.firmwareVersion || 'v1.0.5'}</span>
+            <div className="ota-version" style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', alignItems: 'center' }}>
+              <span>
+                Installed on ESP32: <span className="chip chip--violet mono">{installedVer}</span>
+              </span>
+              <span>
+                Latest on <code>main</code>:{' '}
+                <span className={`chip ${hasFirmwareUpdate ? 'chip--success' : 'chip--neutral'} mono`}>
+                  {latestVer}
+                </span>
+              </span>
             </div>
-            <div className="ota-target">Target: latest artifact on <code>main</code></div>
+            <div className="ota-target">
+              {hasFirmwareUpdate
+                ? `New firmware ${latestVer} is ready on GitHub main branch. Click Install to flash ESP32 over Wi-Fi.`
+                : <>Target: auto-compiled <code>.bin</code> artifact on GitHub <code>main</code> branch</>}
+              {remoteFirmware?.builtAt && (
+                <span> · Built {new Date(remoteFirmware.builtAt).toLocaleString()}</span>
+              )}
+            </div>
           </div>
-          <button className="btn btn--violet" onClick={onOta} disabled={loading}>
-            <CloudLightning size={16} className={loading ? 'pulse' : ''} />
-            {loading ? 'Sending…' : 'Install latest firmware'}
-          </button>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+            {onCheckFirmware && (
+              <button
+                type="button"
+                className="btn btn--ghost"
+                onClick={onCheckFirmware}
+                disabled={checkingFirmware || loading}
+              >
+                <RefreshCw size={15} className={checkingFirmware ? 'spin' : ''} />
+                {checkingFirmware ? 'Checking…' : 'Check GitHub'}
+              </button>
+            )}
+            <button className="btn btn--violet" onClick={onOta} disabled={loading}>
+              <CloudLightning size={16} className={loading ? 'pulse' : ''} />
+              {loading
+                ? 'Sending OTA…'
+                : hasFirmwareUpdate
+                  ? `Install ${latestVer} Now`
+                  : 'Re-install latest firmware'}
+            </button>
+          </div>
         </div>
       </section>
     </div>

@@ -38,10 +38,12 @@ jobs:
         run: |
           mkdir -p smart_offgrid_logic_/build
           arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir smart_offgrid_logic_/build smart_offgrid_logic_/smart_offgrid_logic_.ino
+          FW_VER=$(grep -oP 'FIRMWARE_VERSION\s*=\s*"\K[^"]+' smart_offgrid_logic_/smart_offgrid_logic_.ino || echo "v1.0.6")
+          printf '{\n  "version": "%s",\n  "binaryPath": "smart_offgrid_logic_/build/smart_offgrid_logic_.ino.bin",\n  "builtAt": "%s"\n}\n' "$FW_VER" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > smart_offgrid_logic_/build/version.json
 
       - name: Commit Compiled Firmware Binary to Branch
         if: github.event_name == 'push'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Automated Build: Update compiled ESP32 firmware binary"
-          file_pattern: "smart_offgrid_logic_/build/smart_offgrid_logic_.ino.bin"
+          file_pattern: "smart_offgrid_logic_/build/smart_offgrid_logic_.ino.bin smart_offgrid_logic_/build/version.json"

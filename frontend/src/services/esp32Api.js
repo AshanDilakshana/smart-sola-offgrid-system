@@ -499,3 +499,71 @@ export async function saveCloudEvent(connectionMode = 'cloud', eventText, type =
     );
   } catch (err) {}
 }
+
+export const GITHUB_RAW_MAIN_BASE = 'https://raw.githubusercontent.com/AshanDilakshana/smart-sola-offgrid-system/main';
+export const GITHUB_OTA_BINARY_URL = `${GITHUB_RAW_MAIN_BASE}/smart_offgrid_logic_/build/smart_offgrid_logic_.ino.bin`;
+
+export function parseVersionTuple(verStr) {
+  if (!verStr || typeof verStr !== 'string') return [0, 0, 0];
+  const cleaned = verStr.trim().replace(/^v/i, '');
+  const parts = cleaned.split('.').map((n) => parseInt(n, 10) || 0);
+  return [parts[0] || 0, parts[1] || 0, parts[2] || 0];
+}
+
+export function isNewerFirmwareVersion(installedVer, remoteVer) {
+  if (!installedVer || !remoteVer) return false;
+  const a = parseVersionTuple(installedVer);
+  const b = parseVersionTuple(remoteVer);
+  for (let i = 0; i < 3; i++) {
+    if (b[i] > a[i]) return true;
+    if (b[i] < a[i]) return false;
+  }
+  return false;
+}
+
+export async function fetchLatestGithubFirmware() {
+  const bust = Date.now();
+  // 1. Check compiled build manifest (version.json committed by GitHub Actions after .bin build)
+  try {
+    const res = await fetchWithTimeout(
+      `${GITHUB_RAW_MAIN_BASE}/smart_offgrid_logic_/build/version.json?t=${bust}`,
+      { cache: 'no-store' },
+      6000
+    );
+    if (res.ok) {
+      const meta = await res.json();
+      if (meta && typeof meta.version === 'string' && meta.version.trim()) {
+        return {
+          version: meta.version.trim(),
+          builtAt: meta.builtAt || null,
+          binaryUrl: `${GITHUB_RAW_MAIN_BASE}/${meta.binaryPath || 'smart_offgrid_logic_/build/smart_offgrid_logic_.ino.bin'}`,
+          source: 'build-manifest'
+        };
+      }
+    }
+  } catch (_) {}
+
+  // 2. Fallback: parse FIRMWARE_VERSION directly from main branch .ino source
+  try {
+    const res = await fetchWithTimeout(
+      `${GITHUB_RAW_MAIN_BASE}/smart_offgrid_logic_/smart_offgrid_logic_.ino?t=${bust}`,
+      { cache: 'no-store' },
+      6000
+    );
+    if (res.ok) {
+      const text = await res.text();
+      const match = text.match(/FIRMWARE_VERSION\s*=\s*"([^"]+)"/);
+      if (match && match[1]) {
+        return {
+          version: match[1].trim(),
+          builtAt: null,
+          binaryUrl: GITHUB_OTA_BINARY_URL,
+          source: 'ino-source'
+        };
+      }
+    }
+  } catch (_) {}
+
+  return null;
+}
+

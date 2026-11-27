@@ -12,7 +12,10 @@ import {
   saveCloudEvent,
   subscribeCloudEvents,
   getBackendUrl,
-  setBackendUrl
+  setBackendUrl,
+  fetchLatestGithubFirmware,
+  isNewerFirmwareVersion,
+  GITHUB_OTA_BINARY_URL
 } from './services/esp32Api';
 import { getFlowDirection, packSocFromVoltage, CELL_COUNT } from './utils/battery';
 import Header from './components/Header';
@@ -198,6 +201,9 @@ export default function App() {
   const [confirm, setConfirm] = useState(null);
   const [demoMode, setDemoMode] = useState(false);
   const [demoScenario, setDemoScenario] = useState('charging');
+  const [remoteFirmware, setRemoteFirmware] = useState(null);
+  const [checkingFirmware, setCheckingFirmware] = useState(false);
+  const [otaBannerDismissed, setOtaBannerDismissed] = useState(false);
 
   // PWA install state
   const [deferredPrompt, setDeferredPrompt] = useState(null);
@@ -485,14 +491,46 @@ export default function App() {
     setLoading(false);
   };
 
+  const checkFirmwareUpdate = useCallback(async (showManualToast = false) => {
+    setCheckingFirmware(true);
+    const meta = await fetchLatestGithubFirmware();
+    setCheckingFirmware(false);
+    if (meta && meta.version) {
+      setRemoteFirmware((prev) => {
+        if (prev?.version !== meta.version) {
+          setOtaBannerDismissed(false);
+        }
+        return meta;
+      });
+      if (showManualToast) {
+        const installed = status?.firmwareVersion || 'v1.0.5';
+        if (isNewerFirmwareVersion(installed, meta.version)) {
+          toast(`New firmware ${meta.version} available on GitHub main!`, 'warning');
+        } else {
+          toast(`ESP32 firmware (${installed}) is up to date`, 'success');
+        }
+      }
+    } else if (showManualToast) {
+      toast('Could not check GitHub firmware version', 'warning');
+    }
+  }, [status?.firmwareVersion, toast]);
+
+  useEffect(() => {
+    checkFirmwareUpdate(false);
+    const interval = setInterval(() => checkFirmwareUpdate(false), 60000);
+    return () => clearInterval(interval);
+  }, [checkFirmwareUpdate]);
+
   const runOta = async () => {
     setLoading(true);
-    const firmwareUrl = 'https://raw.githubusercontent.com/AshanDilakshana/smart-sola-offgrid-system/main/smart_offgrid_logic_/build/smart_offgrid_logic_.ino.bin';
-    addLog('Initiating OTA update via MQTT from GitHub binary…', 'warning');
+    const firmwareUrl = remoteFirmware?.binaryUrl || GITHUB_OTA_BINARY_URL;
+    const targetVer = remoteFirmware?.version || 'latest';
+    addLog(`Initiating OTA update (${targetVer}) via MQTT from GitHub binary…`, 'warning');
     const res = await triggerOtaUpdate(esp32Ip, connectionMode, firmwareUrl);
     if (res?.success) {
-      addLog('OTA update command sent! ESP32 downloading & flashing…', 'success');
-      toast('OTA command sent — ESP32 is flashing', 'success');
+      addLog(`OTA update (${targetVer}) command sent! ESP32 downloading & flashing…`, 'success');
+      toast(`OTA command sent — ESP32 is flashing ${targetVer}`, 'success');
+      setOtaBannerDismissed(true);
     } else {
       toast('Failed to trigger OTA firmware update', 'danger');
     }
@@ -500,10 +538,14 @@ export default function App() {
   };
 
   const handleOtaTrigger = () => {
+    const installedVer = status?.firmwareVersion || 'v1.0.5';
+    const targetVer = remoteFirmware?.version || 'latest';
     setConfirm({
-      title: 'Install latest firmware?',
-      message: 'The ESP32 will download the latest build and reboot. Relays keep their safe state during the update.',
-      confirmLabel: 'Start OTA update',
+      title: isNewerFirmwareVersion(installedVer, targetVer)
+        ? `Update ESP32 firmware (${installedVer} → ${targetVer})?`
+        : `Install firmware (${targetVer})?`,
+      message: 'The ESP32 will download the compiled binary from GitHub main over Wi-Fi, flash itself, and reboot automatically. Relays stay in a safe state.',
+      confirmLabel: isNewerFirmwareVersion(installedVer, targetVer) ? `Install ${targetVer} Now` : 'Start OTA update',
       tone: 'brand',
       onConfirm: runOta,
     });
@@ -543,6 +585,12 @@ export default function App() {
   const rawCurrent = Number(status?.batteryCurrent ?? 0);
   const soc = status?.batterySoc !== undefined && status.batterySoc > 0 ? Math.round(status.batterySoc) : packSocFromVoltage(batVolt);
   const direction = getFlowDirection(rawCurrent, !!status?.smpsState);
+  const installedFirmwareVer = status?.firmwareVersion || 'v1.0.5';
+  const hasFirmwareUpdate = !demoMode && Boolean(
+    status?.firmwareVersion
+    && remoteFirmware?.version
+    && isNewerFirmwareVersion(installedFirmwareVer, remoteFirmware.version)
+  );
 
   const mergedLogs = [
     ...logs,
@@ -602,6 +650,35 @@ export default function App() {
             <button type="button" className="btn btn--ghost btn--sm" onClick={toggleDemoMode}>
               Exit Demo
             </button>
+          </div>
+        )}
+
+        {hasFirmwareUpdate && !otaBannerDismissed && (
+          <div className="banner tone-brand reveal">
+            <CloudLightning size={18} />
+            <span>
+              <strong>New Firmware Update Available ({installedFirmwareVer} → {remoteFirmware.version}).</strong>{' '}
+              Ready on GitHub <code>main</code> branch — update your ESP32 wirelessly over Wi-Fi without USB.
+            </span>
+            <div style={{ display: 'flex', gap: '0.45rem', alignItems: 'center', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="btn btn--primary btn--sm"
+                onClick={handleOtaTrigger}
+                disabled={loading}
+              >
+                <CloudLightning size={14} />
+                {loading ? 'Sending…' : `Install ${remoteFirmware.version}`}
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                onClick={() => setOtaBannerDismissed(true)}
+                aria-label="Dismiss firmware update banner"
+              >
+                <X size={14} />
+              </button>
+            </div>
           </div>
         )}
 
@@ -683,6 +760,10 @@ export default function App() {
               onBackendUrlChange={setBackendUrlInput}
               onSaveBackendUrl={handleSaveBackendUrl}
               onOta={handleOtaTrigger}
+              remoteFirmware={remoteFirmware}
+              hasFirmwareUpdate={hasFirmwareUpdate}
+              checkingFirmware={checkingFirmware}
+              onCheckFirmware={() => checkFirmwareUpdate(true)}
             />
           )}
           {activeTab === 'logs' && <LogsTab logs={mergedLogs} filter={logFilter} onFilterChange={setLogFilter} />}
