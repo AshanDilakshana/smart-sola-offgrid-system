@@ -37,7 +37,7 @@ const char* ssid = "SLT FIBER";
 const char* password = "@Ashan20030118";
 
 // Firmware Versioning
-const char* FIRMWARE_VERSION = "v1.0.6";
+const char* FIRMWARE_VERSION = "v1.0.7";
 
 // ---------------------------------------------------------
 // MQTT Broker Configuration (Lightweight Cloud Sync)
